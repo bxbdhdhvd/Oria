@@ -145,6 +145,20 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
     @exclusivity(unchecked) private var readsPaused = false
     @exclusivity(unchecked) private var pendingRead = false
 
+    /// HTTP/1.1 pipelining: parts that arrive while a response is pending wait here (reads stay
+    /// paused meanwhile, so this holds at most what one socket read decoded).
+    private enum Queued {
+        case part(HTTPServerRequestPart)
+        case error(any Error)
+    }
+    @exclusivity(unchecked) private var queue = CircularBuffer<Queued>(initialCapacity: 0)
+    @exclusivity(unchecked) private var draining = false
+    private static let maxQueuedParts = 4096
+
+    /// Plain HTTP/1.1 without compression: responses are serialized by `HTTP1Writer` and written
+    /// as raw bytes (NIO's encoder and pipelining handler are not in the pipeline).
+    private let rawOutput: Bool
+
     private var isHTTP2: Bool { if case .http2 = mode { return true } else { return false } }
 
     init(env: HandlerEnvironment, mode: Mode, state: ConnectionState, channel: Channel) {
@@ -156,6 +170,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         self.state = state
         self.executor = executor
         self.checkInterval = env.requestReadTimeout ?? .seconds(30)
+        if case .http1 = mode { self.rawOutput = !env.config.compression } else { self.rawOutput = false }
     }
 
     // MARK: Lifecycle
@@ -203,6 +218,15 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
+        // A parse error in a pipelined request answers after the responses before it.
+        if !isHTTP2, error is HTTPParserError, mustQueue {
+            queue.append(.error(error))
+            return
+        }
+        handleError(error, context: context)
+    }
+
+    private func handleError(_ error: any Error, context: ChannelHandlerContext) {
         if case .uploading(let upload) = phase { upload.sink.finish(error) }
         // Malformed HTTP: answer 400 (431 for oversized headers) unless a response is already under
         // way, then close. HTTP/2 framing errors are handled by NIOHTTP2.
@@ -220,6 +244,15 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         }
         phase = .closing
         context.close(promise: nil)
+    }
+
+    /// HTTP/1.1 only: a request arriving while the previous response is still pending waits.
+    private var mustQueue: Bool {
+        if !queue.isEmpty { return true }
+        switch phase {
+        case .processing, .closing: return true
+        case .idle, .buffering, .uploading: return false
+        }
     }
 
     // MARK: Write stalls
@@ -252,10 +285,46 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         inReadCycle = true
-        switch unwrapInboundIn(data) {
+        let part = unwrapInboundIn(data)
+        if !isHTTP2 && mustQueue {
+            if case .closing = phase { return }  // connection is closing: drop what follows
+            guard queue.count < Self.maxQueuedParts else {
+                closeNow()
+                return
+            }
+            queue.append(.part(part))
+            return
+        }
+        handle(part, context: context)
+    }
+
+    private func handle(_ part: HTTPServerRequestPart, context: ChannelHandlerContext) {
+        switch part {
         case .head(let head): begin(head, context: context)
         case .body(let chunk): body(chunk, context: context)
         case .end: end(context: context)
+        }
+    }
+
+    /// Feeds queued pipelined parts to the state machine until a request is pending again.
+    private func drainQueue() {
+        guard !draining, let context else { return }
+        draining = true
+        defer { draining = false }
+        while !queue.isEmpty && !readsPaused {
+            switch phase {
+            case .processing, .closing:
+                return
+            case .idle, .buffering, .uploading:
+                switch queue.removeFirst() {
+                case .part(let part): handle(part, context: context)
+                case .error(let error): handleError(error, context: context)
+                }
+            }
+        }
+        if queue.isEmpty, pendingRead, !readsPaused, !mustQueue {
+            pendingRead = false
+            context.read()
         }
     }
 
@@ -289,8 +358,14 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
                 return
             }
             if head.version != .http1_0 {
-                let interim = HTTPResponseHead(version: head.version, status: .continue)
-                context.writeAndFlush(wrapOutboundOut(.head(interim)), promise: nil)
+                if rawOutput {
+                    var buffer = context.channel.allocator.buffer(capacity: 32)
+                    HTTP1Writer.writeContinue(into: &buffer)
+                    context.writeAndFlush(NIOAny(buffer), promise: nil)
+                } else {
+                    let interim = HTTPResponseHead(version: head.version, status: .continue)
+                    context.writeAndFlush(wrapOutboundOut(.head(interim)), promise: nil)
+                }
             }
         }
 
@@ -352,7 +427,9 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
     // MARK: Upload backpressure
 
     func read(context: ChannelHandlerContext) {
-        if readsPaused {
+        // HTTP/1.1: no more reads while a response is pending (like NIO's pipelining handler), so
+        // a pipelining client can't make us buffer unbounded requests.
+        if readsPaused || (!isHTTP2 && mustQueue) {
             pendingRead = true
         } else {
             context.read()
@@ -361,7 +438,11 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
 
     fileprivate func resumeReading() {
         readsPaused = false
-        if pendingRead, let context {
+        if !queue.isEmpty {
+            drainQueue()
+            return
+        }
+        if pendingRead, !(!isHTTP2 && mustQueue), let context {
             pendingRead = false
             context.read()
         }
@@ -510,6 +591,10 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         guard let context else { return }
         var body: ByteBuffer?
         if case .buffer(let buffer) = res.body { body = buffer }
+        if rawOutput {
+            writeRaw(res, body: body, for: request, keepAlive: keepAlive, context: context)
+            return
+        }
         guard let prepared = prepare(res, for: request, keepAlive: keepAlive, length: body?.readableBytes ?? 0) else {
             writeSimple(.internalServerError, version: request.version, close: !isHTTP2)
             return
@@ -520,9 +605,54 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         endResponse(keepAlive: keepAlive)
     }
 
+    private static func statusForbidsBody(_ status: HTTPResponseStatus) -> Bool {
+        let code = status.code
+        return code == 204 || code == 304 || (code >= 100 && code < 200)
+    }
+
+    /// HTTP/1.1 fast path: head and small body in one buffer, one write.
+    private func writeRaw(
+        _ res: Response, body: ByteBuffer?, for request: HTTPRequestHead, keepAlive: Bool, context: ChannelHandlerContext
+    ) {
+        let forbidsBody = Self.statusForbidsBody(res.statusCode)
+        let omitBody = request.method == .HEAD || forbidsBody
+        let bodyBytes = body?.readableBytes ?? 0
+        let inline = !omitBody && bodyBytes <= HTTP1Writer.coalesceLimit
+        var buffer = context.channel.allocator.buffer(capacity: 256 + (inline ? bodyBytes : 0))
+        guard
+            let head = HTTP1Writer.writeHead(
+                into: &buffer, version: request.version, status: res.statusCode, headers: res.headers,
+                contentLength: forbidsBody ? nil : bodyBytes, chunked: false, keepAlive: keepAlive,
+                serverName: env.serverName)
+        else {
+            refuseUnsafeHeaders(version: request.version)
+            return
+        }
+        responseStarted = true
+        let keepAlive = keepAlive && !head.closeRequested
+        if let body, !omitBody, bodyBytes > 0 {
+            if inline {
+                buffer.writeImmutableBuffer(body)
+            } else {
+                context.write(NIOAny(buffer), promise: nil)
+                buffer = body
+            }
+        }
+        finish(last: buffer, keepAlive: keepAlive, context: context)
+    }
+
+    private func refuseUnsafeHeaders(version: HTTPVersion) {
+        FileHandle.standardError.write(Data("[oria] refused to send unsafe response header (CR/LF/NUL)\n".utf8))
+        writeSimple(.internalServerError, version: version, close: !isHTTP2)
+    }
+
     private func sendStream(
         _ res: Response, length: Int?, producer: @Sendable (BodyWriter) async throws -> Void, for request: HTTPRequestHead
     ) async {
+        if rawOutput {
+            await sendStreamRaw(res, length: length, producer: producer, for: request)
+            return
+        }
         let keepAlive = self.keepAlive(for: request, res: res)
         let channel = self.channel
         guard let prepared = prepare(res, for: request, keepAlive: keepAlive, length: length) else {
@@ -545,6 +675,81 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         }
     }
 
+    /// Bytes written by a streaming producer, checked against the declared length.
+    private final class StreamCounter: @unchecked Sendable {
+        var written = 0
+    }
+
+    private func sendStreamRaw(
+        _ res: Response, length: Int?, producer: @Sendable (BodyWriter) async throws -> Void, for request: HTTPRequestHead
+    ) async {
+        var keepAlive = self.keepAlive(for: request, res: res)
+        let forbidsBody = Self.statusForbidsBody(res.statusCode)
+        let omitBody = request.method == .HEAD || forbidsBody
+        // HTTP/1.0 has no chunked encoding: without a length, closing the connection ends the body.
+        let chunked = length == nil && !forbidsBody && (request.version.major > 1 || (request.version.major == 1 && request.version.minor >= 1))
+        let allocator = res.allocator
+        var buffer = allocator.buffer(capacity: 256)
+        guard
+            let head = HTTP1Writer.writeHead(
+                into: &buffer, version: request.version, status: res.statusCode, headers: res.headers,
+                contentLength: forbidsBody ? nil : length, chunked: chunked, keepAlive: keepAlive,
+                serverName: env.serverName)
+        else {
+            onLoop { self.refuseUnsafeHeaders(version: request.version) }
+            return
+        }
+        if head.closeRequested { keepAlive = false }
+        onLoop { self.responseStarted = true }
+        let counter = StreamCounter()
+        do {
+            try await writeNow([buffer])
+            if !omitBody {
+                // Awaiting each chunk's write is the backpressure.
+                try await producer(
+                    BodyWriter(allocator: allocator) { chunk in
+                        guard chunk.readableBytes > 0 else { return }
+                        counter.written += chunk.readableBytes
+                        if let length, counter.written > length {
+                            throw HTTPError(.internalServerError, "Streamed more bytes than the declared length")
+                        }
+                        if chunked {
+                            try await self.writeNow([
+                                HTTP1Writer.chunkPrefix(chunk.readableBytes, allocator: allocator), chunk,
+                                allocator.buffer(staticString: "\r\n"),
+                            ])
+                        } else {
+                            try await self.writeNow([chunk])
+                        }
+                    })
+            }
+            // A short body would leave the client waiting for bytes that never come: close instead.
+            if let length, !omitBody, counter.written != length { keepAlive = false }
+            let finalKeepAlive = keepAlive
+            onLoop {
+                guard let context = self.context else { return }
+                let last = chunked && !omitBody ? allocator.buffer(staticString: "0\r\n\r\n") : allocator.buffer(capacity: 0)
+                self.finish(last: last, keepAlive: finalKeepAlive, context: context)
+            }
+        } catch {
+            onLoop { self.closeNow() }
+        }
+    }
+
+    /// Writes and flushes buffers from a request task; completes when they reached the socket.
+    private func writeNow(_ buffers: [ByteBuffer]) async throws {
+        let promise = eventLoop.makePromise(of: Void.self)
+        onLoop {
+            guard let context = self.context else {
+                promise.fail(ChannelError.ioOnClosedChannel)
+                return
+            }
+            for buffer in buffers.dropLast() { context.write(NIOAny(buffer), promise: nil) }
+            context.writeAndFlush(NIOAny(buffers[buffers.count - 1]), promise: promise)
+        }
+        try await promise.futureResult.get()
+    }
+
     /// Small canned JSON error. On the event loop.
     private func writeSimple(_ status: HTTPResponseStatus, version: HTTPVersion, close: Bool) {
         guard let context else { return }
@@ -552,48 +757,69 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         let body = ByteBuffer(string: "{\"error\":\"\(status.reasonPhrase)\"}")
         var headers = HTTPHeaders()
         headers.add(name: "content-type", value: "application/json; charset=utf-8")
+        if rawOutput {
+            var buffer = context.channel.allocator.buffer(capacity: 256)
+            _ = HTTP1Writer.writeHead(
+                into: &buffer, version: version, status: status, headers: headers, contentLength: body.readableBytes,
+                chunked: false, keepAlive: !close, serverName: env.serverName)
+            buffer.writeImmutableBuffer(body)
+            finish(last: buffer, keepAlive: !close, context: context)
+            return
+        }
         headers.add(name: "content-length", value: String(body.readableBytes))
         if close && !isHTTP2 { headers.add(name: "connection", value: "close") }
         headers.add(name: "date", value: HTTPDate.now())
         context.write(wrapOutboundOut(.head(HTTPResponseHead(version: version, status: status, headers: headers))), promise: nil)
         context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
-        let done = context.eventLoop.makePromise(of: Void.self)
-        context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: done)
-        finished(keepAlive: !close, written: done.futureResult)
+        let promise = completeRequest(keepAlive: !close)
+        context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: promise)
+        afterResponse()
     }
 
-    /// Writes the final `.end`. State is updated *before* the write: NIO's pipelining handler
-    /// delivers the next queued request synchronously from inside that write.
+    /// Writes the final `.end` (parts mode). State is updated *before* the write.
     private func endResponse(keepAlive: Bool) {
         guard let context else { return }
-        let done = context.eventLoop.makePromise(of: Void.self)
-        finished(keepAlive: keepAlive, written: done.futureResult)
-        if inReadCycle && keepAlive {
-            context.write(wrapOutboundOut(.end(nil)), promise: done)
-            if !flushPending {
-                flushPending = true
-                // Safety net: flush at the end of this event-loop tick even if no readComplete comes.
-                context.eventLoop.execute { [self] in
-                    if self.flushPending {
-                        self.flushPending = false
-                        self.context?.flush()
-                    }
+        let promise = completeRequest(keepAlive: keepAlive)
+        emit(wrapOutboundOut(.end(nil)), promise: promise, context: context)
+        afterResponse()
+    }
+
+    /// Writes the last bytes of a raw response and moves on to the next request (or closes).
+    private func finish(last: ByteBuffer, keepAlive: Bool, context: ChannelHandlerContext) {
+        let promise = completeRequest(keepAlive: keepAlive)
+        emit(NIOAny(last), promise: promise, context: context)
+        afterResponse()
+    }
+
+    /// Flush coalescing: responses written while reads are being delivered (or while draining
+    /// pipelined requests) are flushed once, at `channelReadComplete` or the end of this tick.
+    private func emit(_ data: NIOAny, promise: EventLoopPromise<Void>?, context: ChannelHandlerContext) {
+        guard promise == nil, inReadCycle || draining else {
+            context.writeAndFlush(data, promise: promise)
+            return
+        }
+        context.write(data, promise: nil)
+        if !flushPending {
+            flushPending = true
+            // Safety net: flush at the end of this event-loop tick even if no readComplete comes.
+            context.eventLoop.execute { [self] in
+                if self.flushPending {
+                    self.flushPending = false
+                    self.context?.flush()
                 }
             }
-        } else {
-            context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: done)
         }
     }
 
-    /// The response's last byte is about to be queued. On the event loop.
-    private func finished(keepAlive: Bool, written: EventLoopFuture<Void>) {
+    /// The response's last bytes are about to be queued. Returns a promise to attach to that write
+    /// when the connection must close after it (closing a NIO channel drops queued writes).
+    private func completeRequest(keepAlive: Bool) -> EventLoopPromise<Void>? {
         let complete = requestComplete
         if isHTTP2 {
             // The stream closes itself once both sides ended. If we answered before reading the
             // whole request (e.g. 413), close it.
             phase = .closing
-            if !keepAlive || !complete { written.whenComplete { _ in self.context?.close(promise: nil) } }
-            return
+            return !keepAlive || !complete ? closeAfterWrite() : nil
         }
         _ = state.endRequest()
         if keepAlive && complete && !env.isShuttingDown {
@@ -601,15 +827,28 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
             phase = .idle
             requestComplete = false
             if let timeout = env.requestReadTimeout { deadline = .now() + timeout }
-        } else {
-            phase = .closing
-            // Close only after the bytes are out: closing a NIO channel drops queued writes.
-            written.whenComplete { _ in self.context?.close(promise: nil) }
+            return nil
         }
+        phase = .closing
+        queue.removeAll()
+        return closeAfterWrite()
+    }
+
+    private func closeAfterWrite() -> EventLoopPromise<Void> {
+        let promise = eventLoop.makePromise(of: Void.self)
+        promise.futureResult.whenComplete { _ in self.context?.close(promise: nil) }
+        return promise
+    }
+
+    /// After a response: serve the next pipelined request, or resume reading.
+    private func afterResponse() {
+        guard !isHTTP2, case .idle = phase else { return }
+        if !queue.isEmpty || pendingRead { drainQueue() }
     }
 
     private func closeNow() {
         phase = .closing
+        queue.removeAll()
         context?.close(promise: nil)
     }
 
