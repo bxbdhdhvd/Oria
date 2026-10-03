@@ -37,30 +37,48 @@ try await app.listen(3000)
 | Route lookup | linear scan of every layer | compiled radix trie, O(path depth) |
 | Handlers | callbacks | `async`/`await`, `throws` |
 | Request bodies | needs `express.json()` | `try req.json(MyType.self)`, typed `Codable` |
-| Backpressure | manual | end-to-end via `NIOAsyncChannel` |
+| Backpressure | manual | end-to-end: socket reads pause while a handler or upload consumer is busy |
+| Uploads, ranges | `multer`, `send` packages | built in: `app.upload(...)` streams to disk; `res.sendFile` does Range/ETag/304 |
 | HTTP/2, TLS | separate modules (`http2`, `https`, `spdy`) | built in: `config.tls = ...` gives HTTPS + HTTP/2 via ALPN |
 | WebSockets | `ws` / `express-ws` packages | built in: `app.ws(...)`, rooms with non-blocking broadcast |
 
-**Benchmarks** (one 4-vCPU Linux VM, release build, no logging; the load generator runs on the same
-machine and competes for CPU, so treat these as relative numbers):
+## Performance
 
-| Workload | Tool | Express 4 | Oria |
-|---|---|---|---|
-| HTTP/1.1 `GET /` plaintext, 256 conns | wrk | 10.3k req/s, p99 923 ms | **70.3k req/s**, p99 9.7 ms |
-| HTTP/1.1 `GET /json`, 256 conns | wrk | 10.0k req/s, p99 354 ms | **64.2k req/s**, p99 10.3 ms |
-| HTTPS (HTTP/1.1 over TLS) `GET /json`, 256 conns | wrk | - | **58.5k req/s**, p99 11 ms |
-| HTTP/2 over TLS `GET /json`, 64 conns × 32 streams | h2load | - | **54.3k req/s**, 0 failed |
-| HTTP/2 router + rate limiter + actor, 64 × 32 | h2load | - | **42.2k req/s** |
-| HTTP/2 `POST` JSON body, 16 × 100 | h2load | - | **40.8k req/s** |
-| WebSocket echo round trips, 256 conns (32 B) | oria-bench | - | **67.4k msg/s**, p99 8.7 ms |
-| WebSocket echo round trips, 1000 conns | oria-bench | - | **65.2k msg/s**, p99 33 ms |
-| WebSocket echo, 100 conns × 16 KB | oria-bench | - | **30.5k msg/s** (≈500 MB/s each way) |
-| WebSocket broadcast, 1 sender → 1000 receivers | oria-bench | - | **75k deliveries/s**, p99 80 ms |
-| Idle WebSockets held open | oria-bench | - | **10,000** at ~25 KB each; HTTP still 59k req/s alongside |
+Measured in a container limited to **2 CPU cores and 256 MB of RAM** (`--cpuset-cpus=0,1
+--memory=256m`), with the load generator pinned to the other 2 cores of the same 4-vCPU cloud VM.
+Release build, no logging. Reproduce everything below with `scripts/container-bench.sh`.
 
-Reproduce with `scripts/bench.sh` (HTTP/1.1), `h2load` (HTTP/2) and `oria-bench` (WebSockets; see
-below). Broadcast capacity on this machine tops out around 130k deliveries/s; offering more than
-that grows latency (queued, not dropped).
+| Workload | Result |
+|---|---|
+| HTTP/1.1 `GET /` plaintext, pipelined ×16, 64 conns | **100k req/s** |
+| HTTP/1.1 `GET /json`, pipelined ×16, 64 conns | **65k req/s** |
+| HTTP/1.1 `GET /` keep-alive (one request at a time), 64 conns | **32.6k req/s**, p50 1.8 ms, p99 4.3 ms |
+| HTTP/1.1 `GET /json`, 1 / 2 / 4 conns | 8.7k / 16.1k / 25.7k req/s, **p50 104–132 µs, p99 329 / 570 / 890 µs** |
+| Router + rate limiter + `actor` call, keep-alive, 64 conns | 22.2k req/s, p99 5.6 ms |
+| HTTP/2 over TLS, 64 conns × 16 streams (h2load) | 25.2k req/s, 0 failed |
+| WebSocket echo round trips, 256 conns, 32 B | 31.7k msg/s, p99 17.6 ms |
+| 1 GiB raw upload (`PUT`, streamed to disk) | 3.6 s, **server peak RSS 29 MB** |
+| 1 GiB multipart upload (`curl -F`) | 4.6 s |
+| 32 parallel 32 MiB uploads | 3.5 s, all 200, peak RSS 66 MB |
+| 1 GiB file download / 1 MB range from the middle | 2.3 s, byte-identical / `206`, byte-identical |
+| 4 GiB generated streaming response | 1.8 s (≈2.3 GB/s) |
+| Idle memory | ~26 MB RSS |
+
+**How to read these numbers.**
+
+- The server-side work per request is small. On this VM a request costs about 54 µs of CPU, of
+  which the kernel's loopback TCP path (`writev`/`read`/`epoll`) is the largest part. Without
+  pipelining, the kernel is the limit: a bare SwiftNIO "hello world" on the same 2 cores does 46k
+  req/s. Oria spends about 20% more CPU per request than bare NIO, for routing, middleware,
+  `async` handlers and Express-style request/response objects.
+- **≥100k req/s on 2 cores** is reached with pipelining (which is how TechEmpower measures
+  plaintext) or with more cores. Throughput scales with cores, because each event loop is
+  independent and the hot path takes no locks. On a dedicated 4–8 core machine, with the load
+  generator elsewhere, expect roughly 2–4× the keep-alive numbers above.
+- **Sub-millisecond p99** holds until the CPU saturates: p99 is 0.89 ms at 25.7k req/s on 2 cores.
+  Once the CPU is fully busy (64 connections hammering 2 cores), requests queue and p99 is a few
+  milliseconds, as with any server. Size for about 60–70% CPU if you need sub-ms
+  tails. These are shared, noisy cloud vCPUs, so dedicated hardware tails will be tighter.
 
 ## Install
 
@@ -74,7 +92,8 @@ targets: [
 ]
 ```
 
-Requires Swift 6.0+ (tested with 6.2.1 on Ubuntu 24.04). macOS 14+ or Linux.
+Requires Swift 6.0+ (tested with 6.2.1 on Ubuntu 24.04; Swift 6.2 enables `Task.immediate` and
+`Span`-based parsing, older compilers fall back automatically). macOS 15+ or Linux.
 
 ## Guide
 
@@ -178,6 +197,82 @@ res.stream { writer in
 }
 ```
 
+### File uploads (`multipart/form-data` and raw bodies)
+
+Upload routes stream the body to disk as it arrives. Memory use stays flat whatever the file size:
+a 1 GiB upload peaks at about 29 MB RSS for the whole server. Socket reads pause whenever the
+disk falls behind (backpressure), so a fast client can't make the server buffer data.
+
+```swift
+app.upload("/avatar", options: UploadOptions(
+    maxFileSize: 5 << 20,                  // 413 above this
+    maxFiles: 1,
+    allowedFileTypes: ["image/png", "image/jpeg"],   // 415 otherwise
+    directory: "/var/app/uploads"          // default: the system temp directory
+)) { req, res in
+    let form = req.uploads!                // MultipartForm
+    let name = form.field("displayName")   // text fields (kept in memory, maxFieldSize each)
+    guard let file = form.file("avatar") else { throw HTTPError(.badRequest) }
+    file.filename        // sanitized: "../../x.png" -> "x.png"
+    file.contentType     // as sent by the client: verify it if it matters
+    file.size
+    try await file.move(to: "/var/app/avatars/\(UUID()).png")   // keep it
+    res.status(.created).send("ok")
+}                                          // anything not moved is deleted after the response
+
+// Raw body (no multipart): PUT /backups/db.tar
+app.upload("/backups/:name", method: .PUT, options: UploadOptions(maxBodySize: 10 << 30)) { req, res in
+    let body = req.uploadedBody!           // UploadedFile on disk
+    try await body.move(to: "/srv/backups/" + safeName(req.params["name"]!))
+    res.sendStatus(.created)
+}
+```
+
+- **Limits** (`UploadOptions`): `maxBodySize` and `maxFileSize` (1 GiB default), `maxFiles` (20),
+  `maxFields` (200), `maxFieldSize` (1 MiB), `maxPartHeaderSize` (16 KiB), `allowedFileTypes`, and
+  `idleTimeout` (30 s without body bytes closes the upload; it replaces `requestReadTimeout` so long
+  uploads aren't cut off). A declared `Content-Length` above the limit gets `413` before any byte is
+  read. `Expect: 100-continue` is supported, so `curl` waits for the go-ahead.
+- **Temporary files** are created with mode `0600` and are *transactional*: on Linux they have no
+  name (`O_TMPFILE`) until complete, so an aborted upload never leaves a partial file behind. Files
+  you don't `move` are deleted after the response.
+- **Small forms on normal routes:** `try req.multipart()` parses an in-memory multipart body (bounded
+  by `maxBodySize`) with the same limits and errors. Prefer `app.upload` for files.
+- Works over HTTP/1.1 (`Content-Length` or chunked) and HTTP/2.
+
+### Files, downloads and Range requests
+
+```swift
+app.get("/media/:id") { req, res in
+    try await res.sendFile("/srv/media/\(try lookup(req.params["id"]!))", for: req)
+}
+app.get("/report") { req, res in
+    try await res.download("/srv/reports/q3.pdf", filename: "Q3 résumé.pdf", for: req)
+}
+app.use("/assets", serveStatic("./public", StaticOptions(maxAge: 86400)))   // same engine
+```
+
+`sendFile` streams with non-blocking file I/O (256 KiB reads, about 1.2 GB/s for a single download on
+the test VM) and implements HTTP caching and ranges in full:
+
+- `Range: bytes=0-99`, open-ended `bytes=500-` and suffix `bytes=-500` ranges give `206` with
+  `Content-Range`. Several ranges give `multipart/byteranges`. Video seeking and `curl -C -` resume
+  work.
+- Overlapping ranges are merged. More than `maxRanges` (16) ranges get the whole file instead, so a
+  client can't make the server send the same bytes many times. Unsatisfiable ranges get `416` with
+  `Content-Range: bytes */size`.
+- `ETag` (strong, from size and mtime with nanoseconds) and `Last-Modified`.
+- `If-None-Match` / `If-Modified-Since` give `304`; `If-Match` gives `412`. `If-Range` falls back to
+  the full file if it changed.
+- `HEAD` returns the headers without a body.
+- `download` adds `Content-Disposition: attachment` with an ASCII fallback plus an RFC 5987 UTF-8
+  filename.
+- `path` is used as given: never build it from unvalidated input (use `serveStatic`, which blocks
+  traversal and dotfiles, or validate names yourself).
+
+Generated large responses use `res.stream(length:)`: each `writer.write` waits until the socket can
+take more, so a 4 GiB response uses no more memory than one chunk.
+
 ### Errors
 
 Throw from any handler or middleware:
@@ -246,9 +341,14 @@ behind is disconnected instead of buffering without limit.
 `WebSocketOptions` per route: `maxFrameSize`, `maxMessageSize` (both 1 MiB), `allowedOrigins`,
 `protocols` (subprotocol negotiation), `pingInterval`, `closeTimeout`, `messageBuffer`, `outboxLimit`.
 
-> **Set `allowedOrigins` for browser apps that rely on cookies.** Browsers don't apply CORS to
-> WebSockets, so without it any website can open a socket with your user's cookies (cross-site
-> WebSocket hijacking).
+> **Cross-site WebSocket hijacking is blocked by default.** Browsers don't apply CORS to WebSockets,
+> so by default Oria only accepts browser handshakes whose `Origin` matches the `Host` (same
+> origin). Clients that send no `Origin` (native apps, servers) are unaffected. If your front end is
+> served from another origin, list it: `allowedOrigins: ["https://app.example.com"]`. `["*"]`
+> allows any origin.
+
+Malformed handshakes get proper answers: wrong `Sec-WebSocket-Version` gives `426` with
+`Sec-WebSocket-Version: 13`, and a missing or invalid key, or a body on the upgrade request, gives `400`.
 
 ### HTTPS and HTTP/2
 
@@ -263,7 +363,8 @@ try await app.listen(443)
 
 With TLS on, clients negotiate HTTP/2 or HTTP/1.1 via ALPN. Your routes and middleware don't change:
 every HTTP/2 stream becomes the same `Request`/`Response`. `wss://` works the same as `ws://`
-(browsers open WebSockets over HTTP/1.1). Only TLS 1.2 and 1.3 are accepted. `req.isSecure` is true
+(browsers open WebSockets over HTTP/1.1). Only TLS 1.2 (ECDHE + AEAD suites only, so always
+forward secret) and TLS 1.3 are accepted. `req.isSecure` is true
 on TLS connections (or behind a trusted proxy sending `X-Forwarded-Proto: https`). Set
 `config.http2 = false` to offer only HTTP/1.1, and `config.http2MaxConcurrentStreams` (default 100)
 to cap streams per connection.
@@ -298,57 +399,169 @@ config.maxHeaderSize = 16 * 1024           // request line + headers (431/400 ab
 config.maxHeaderCount = 200
 config.tls = try .files(certificateChain: "cert.pem", privateKey: "key.pem")
 config.http2 = true                        // with TLS: HTTP/2 via ALPN
+config.runHandlersOnEventLoops = true      // handlers run on the connection's event loop (no thread hops)
 let app = Oria(configuration: config)
 ```
 
-How one process scales:
+`runHandlersOnEventLoops` (default `true`) runs request handlers on the connection's own event
+loop; see the architecture section below.
 
-- **All cores, one process.** SwiftNIO runs one event loop per core, and connections are spread across them.
-- **Lock-free hot path.** Routes are compiled once into an immutable trie that every thread shares.
-- **Backpressure.** Each connection is a structured-concurrency task over `NIOAsyncChannel`, so a slow
-  client can't make the server buffer unbounded data. Large accept buffers keep new connections
-  flowing under load.
-- **Cheap HTTP/2 streams.** Each stream is collected on its event loop and dispatched to one task, with
-  no per-stream async-channel machinery (2.5× faster than wrapping every stream).
-- **Graceful shutdown.** On SIGINT/SIGTERM the server stops accepting and closes idle keep-alive
-  connections at once. In-flight HTTP/1.1 requests and HTTP/2 streams finish (HTTP/1.1 responses carry
-  `Connection: close`), WebSockets get a 1001 close frame, and anything left is force-closed after
-  `shutdownGracePeriod`. Responses are fully written before a socket closes. Connections caught
-  mid-accept or mid-handshake are closed, not leaked or left hanging. Covered by stress tests, plus a
-  SIGTERM-under-mixed-load chaos run (10/10 clean exits).
-- **Memory.** Live heap returns to baseline after load: 100k WebSockets opened and closed left ~13 MB
-  in use. glibc keeps freed memory in per-thread arenas, so RSS can sit above that. If that matters,
-  run with `MALLOC_ARENA_MAX=2` or a different allocator.
-- **Optional: handlers on the I/O threads.** Call `Oria.runConcurrencyOnEventLoops()` as the first line
-  of `main.swift` to make Swift Concurrency run on the event loops. This removes a thread hop per
-  read and write. In our tests it lowered tail latency for routes that await actors at very high
-  connection counts, but reduced throughput on the same routes. Benchmark your own workload
-  before enabling it.
+### Architecture: how one process scales
+
+- **All cores, one process.** SwiftNIO runs one event loop per core (`config.threads`), and
+  connections are spread across them. Routes compile once into an immutable radix trie that every
+  thread shares, so lookup takes no locks.
+- **One handler per connection, no hops.** Each HTTP/1.1 connection (or HTTP/2 stream) has a single
+  NIO `ChannelDuplexHandler` that parses the request, runs your `async` handler, and writes the
+  response.
+  - Handlers run on a custom Swift Concurrency `TaskExecutor` backed by that connection's event loop
+    (`Task(executorPreference:)`).
+  - On Swift 6.2, `Task.immediate` starts the handler synchronously inside the read callback. A
+    handler that doesn't suspend writes its response in the same event-loop tick that read the
+    request, as hand-written NIO code would.
+  - When a handler does suspend (a database call, an actor), it resumes on the same event loop, so
+    no thread hops happen and no locks are taken on the request path.
+  - Set `config.runHandlersOnEventLoops = false` to use the global concurrent executor instead. That
+    is better if your handlers do heavy CPU work, which would otherwise delay other connections on
+    the same loop.
+- **Flush coalescing.** Responses written during a read cycle are flushed once at the end of it, so
+  pipelined requests share one `writev`.
+- **Cheap timers.** Read deadlines, upload idle timeouts and write-stall detection share one
+  scheduled check per connection. Arming a deadline is a stored-property write, not a timer
+  allocation.
+- **Backpressure everywhere.** Upload consumers pull body chunks through a bounded
+  `NIOThrowingAsyncSequenceProducer`: the socket stops being read while the disk is busy. Streaming
+  responses await the socket. A client that stops reading (slow-read attack) is cut off after
+  `idleTimeout`.
+- **Memory safety.** Everything is Swift 6 language mode with strict concurrency checking, so data
+  races are compile errors. No `unsafe` pointer code in the framework:
+  - Multipart boundary search uses bounds-checked `Span` (Swift 6.2).
+  - Buffers are `ByteBuffer` with copy-on-write.
+  - The few per-connection fields marked `@exclusivity(unchecked)` are confined to one event loop by
+    construction.
+- **Graceful shutdown.** On SIGINT/SIGTERM the server:
+  - stops accepting and closes idle keep-alive connections at once;
+  - lets in-flight requests finish (HTTP/1.1 responses carry `Connection: close`);
+  - sends WebSockets a 1001 close frame;
+  - force-closes whatever is left after `shutdownGracePeriod`.
+- **Resilient accept loop.** Transient accept errors (out of file descriptors, `ENOBUFS`, a socket
+  option the sandbox refuses) are logged and retried. They never stop the server.
+- **Memory.** About 26 MB RSS idle and about 30 KB per idle connection. Uploads and downloads of any
+  size stay flat. glibc keeps freed memory in per-thread arenas, so after a spike RSS can sit above
+  the live heap. Use `MALLOC_ARENA_MAX=2` if that matters.
+
+## Running in a container
+
+```bash
+docker build -t my-oria-app .
+docker run -d -p 3000:3000 --cpus=2 --memory=256m \
+  -v /srv/uploads:/data --name api my-oria-app
+```
+
+The included `Dockerfile` is multi-stage. It compiles with `swift:6.2-noble` and ships the binary on
+`swift:6.2-noble-slim`, running as an unprivileged user (uid 10001) with `/data` for uploads.
+`docker stop` sends SIGTERM, which triggers the graceful shutdown. Tips:
+
+- Put uploads on a volume (`-v`), not the container's overlay filesystem: file I/O was about 2.5×
+  faster in our tests.
+- `--network host` (or a Kubernetes pod network) avoids docker-proxy/NAT overhead for small-request
+  workloads.
+- Set `THREADS` to the CPUs you give the container. Oria defaults to the host's core count, which
+  can exceed a `--cpus` limit.
+- `scripts/container-bench.sh` builds the image and runs the full benchmark suite above against a
+  CPU- and memory-limited container (`CPUS=0,1 MEMORY=256m`).
 
 ## Security
 
-These defenses are on by default and covered by tests that attack a real socket:
+These defenses are on by default and covered by tests that attack a real socket (110 tests in total):
 
 | Attack | Behavior |
 |---|---|
-| Request smuggling (CL + TE, duplicate/conflicting `Content-Length`, obfuscated `Transfer-Encoding`, bad chunk sizes) | `400` and the connection closes; the smuggled request never reaches a handler |
+| Request smuggling (CL + TE, duplicate/conflicting `Content-Length`, obfuscated `Transfer-Encoding`, bad chunk sizes, bare LF) | `400` and the connection closes; the smuggled request never reaches a handler |
 | Header, URL and header-count bombs | `431`/`400` (`maxHeaderSize`, `maxHeaderCount`) |
-| Huge or endless bodies, including chunked | `413` (`maxBodySize`) |
-| Slowloris (dribbled headers) and slow-body uploads | closed after `requestReadTimeout`; truncated bodies never reach handlers |
+| Huge or endless bodies, including chunked | `413` (`maxBodySize`, per-route `UploadOptions`), refused before reading when `Content-Length` says so |
+| Slowloris (dribbled headers), slow-body uploads | closed after `requestReadTimeout` / upload `idleTimeout` |
+| Slow-read (client stops reading a large response) | closed after `idleTimeout`; memory stays flat meanwhile |
 | Garbage / non-HTTP input, unknown methods, bad versions | `400` and an immediate close |
 | Response splitting (CR/LF in a header value, e.g. `res.redirect(userInput)`) | refused, `500` instead |
-| Parameter flooding | only the first 1000 query/form parameters are parsed |
-| Deeply nested JSON | `400` (decoder depth limit), no crash |
-| `Upgrade: h2c` or other unknown upgrades | served as normal HTTP (NIO would otherwise drop the request) |
-| HTTP/2 rapid reset (CVE-2023-44487), HPACK header bombs | `GOAWAY` and the connection closes; other clients unaffected |
-| TLS 1.0 / 1.1 | handshake refused |
-| WebSocket: unmasked frames / invalid UTF-8 / oversized frames or messages | close `1002` / `1007` / `1009` |
-| Cross-site WebSocket hijacking | `403` when `allowedOrigins` is set |
+| Upload path traversal (`../`, absolute, backslashes, NUL in filenames) | filenames sanitized to a base name; temp files are random, `0600`, never visible half-written |
+| Upload abuse (too many files/fields, huge part headers, disallowed types, malformed multipart) | `413` / `415` / `400`, temporary files removed |
+| Range amplification (`bytes=0-,0-,0-…`, hundreds of ranges) | ranges merged; >16 ranges serve the file once |
+| Parameter flooding / deeply nested JSON | first 1000 parameters only / `400` (decoder depth limit) |
+| `Upgrade: h2c` or other unknown upgrades | served as normal HTTP |
+| HTTP/2 rapid reset (CVE-2023-44487), CONTINUATION flood (CVE-2024-27316), SETTINGS/PING floods, HPACK bombs | `GOAWAY` and the connection closes; other clients unaffected |
+| TLS 1.0 / 1.1, non-forward-secret or CBC cipher suites | handshake refused |
+| WebSocket: unmasked frames / invalid UTF-8 / reserved opcodes / oversized frames or messages | close `1002` / `1007` / `1002` / `1009` |
+| Cross-site WebSocket hijacking | `403` unless same-origin or in `allowedOrigins` |
+| Malformed WebSocket handshakes, upgrade with a body | `426` / `400` |
 | Path traversal in `serveStatic` | `403`; dotfiles hidden |
 | Slow WebSocket consumers in a broadcast | disconnected after `outboxLimit`; never stall others |
+| File-descriptor exhaustion | accept errors are retried, the server keeps running; cap with `maxConnections` |
 
-Not handled for you: authentication, CSRF tokens for cookie-authenticated forms, and per-user rate
-limits beyond `rateLimit`'s IP key. Put Oria behind a load balancer if you need DDoS absorption.
+**Penetration test.** An independent black-box pass ran these attacks against a release build over
+HTTP/1.1, HTTPS + HTTP/2 and WebSocket. It covered smuggling variants, limit bypasses, slowloris /
+slow-POST / slow-read, upload traversal (verified on disk), malformed multipart, range abuse,
+HTTP/2 floods (2000-stream rapid reset, 20k SETTINGS/PING frames, CONTINUATION flood, 40 KB header
+lists), TLS downgrade, WebSocket protocol violations, header injection and 800 idle connections.
+
+- Results: **no crashes, no Critical or High findings.** Peak RSS during the floods was 41 MB.
+- Fixed since: the two Medium findings (WebSocket origin default, slow-read drain) and the Low ones
+  (legacy TLS 1.2 cipher, handshake error answers, upgrade-with-body).
+- Remaining Low/Info items:
+  - An overflowing chunk size (`FFFFFFFFFFFFFFFF`) waits for `requestReadTimeout` instead of an
+    immediate `400`. That is NIO parser behavior and not exploitable for smuggling.
+  - `maxConnections` is unlimited by default; set it.
+  - An oversized WebSocket frame can end with a TCP reset rather than a visible 1009, because the
+    socket closes with unread input.
+
+Not handled for you: authentication, CSRF tokens for cookie-authenticated forms, per-user rate
+limits beyond `rateLimit`'s IP key, antivirus/content scanning of uploads, and disk quotas (cap
+uploads with `UploadOptions` and monitor free space). Put Oria behind a load balancer if you need
+DDoS absorption.
+
+## Can I run a production service on it?
+
+**Yes, for a typical API, upload or WebSocket service, with the checklist below.** Honest
+assessment:
+
+**Strengths**
+- The protocol layers are SwiftNIO (Apple's networking stack, also used by Vapor, gRPC Swift and
+  AWS/Apple services): HTTP/1.1 parsing, HTTP/2 framing and flood protection, TLS (BoringSSL) and
+  WebSocket framing. Oria doesn't reimplement those.
+- Defenses against the common HTTP attacks are on by default and tested, and an adversarial pass
+  found no crash or high-severity issue.
+- Predictable resources: about 26 MB idle, flat memory for any body size, and bounded queues
+  everywhere (accept buffer, upload chunks, WebSocket outboxes).
+- Graceful shutdown that fits containers and rolling deploys.
+
+**Gaps and risks**
+- **Young code.** The framework layer (routing, request handler, uploads, ranges) is new and has
+  only this test suite and one pen test behind it. It has no production mileage. Vapor or
+  Hummingbird are more battle-tested if you need that today.
+- **No built-in observability**: no metrics endpoint, structured logging or tracing yet. Add a
+  middleware that records latency and status into your metrics system (Prometheus via
+  swift-metrics, for example) before going live.
+- **API stability.** This is pre-1.0, so pin a commit.
+- **Blocking code on the event loop.** With `runHandlersOnEventLoops` (the default), CPU-heavy or
+  blocking work in a handler delays every connection on that loop. Move it to
+  `Task.detached`/a thread pool, or turn the option off.
+- No HTTP/3, h2c or WebSocket compression (see below).
+
+**Production checklist**
+1. Run 2+ instances behind a load balancer (or `reusePort` for several processes on one host) for
+   zero-downtime deploys. Point health checks at a cheap route.
+2. Set `config.maxConnections` (e.g. 20–50k per instance) and raise the file-descriptor limit
+   (`ulimit -n`, or LimitNOFILE in systemd) above it.
+3. Set `THREADS` to the cores you allocate. Keep CPU under about 70% if you need sub-ms p99.
+4. Terminate TLS in Oria (`config.tls`) or at the load balancer. If at the load balancer, set
+   `config.trustProxy = true` so `req.ip` and `req.isSecure` are correct.
+5. Configure `UploadOptions` per upload route: size, count and type limits. Put the upload directory
+   on its own volume and alert on free space.
+6. Set `allowedOrigins` on WebSocket routes used by a front end on another origin, and use
+   `securityHeaders()` and a strict `cors()` origin list.
+7. Add authentication and per-user rate limits for your domain, plus metrics, logging and alerts.
+8. Load-test your real handlers in your target container size with `scripts/container-bench.sh` as a
+   template.
 
 ## Testing your app
 
@@ -373,9 +586,12 @@ Read it from `server.port` and call `await server.shutdown()` when done.
 
 ```bash
 swift build
-swift test                                   # 86 tests: routing, HTTP/1, HTTP/2, TLS, WebSockets, attacks
+swift test                                   # 110 tests: routing, HTTP/1, HTTP/2, TLS, WebSockets, uploads, ranges, attacks
+ORIA_MEMORY_TESTS=1 swift test --filter uploadMemoryStaysFlat   # RSS check, run alone
 swift run -c release oria-example            # example app on :3000
 scripts/bench.sh 256 10s                     # HTTP/1.1 load test (needs wrk)
+scripts/container-bench.sh                   # everything, inside a 2-CPU / 256 MB container
+wrk -t2 -c64 -d10s -s scripts/pipeline.lua http://127.0.0.1:3000/ -- 16   # pipelined
 
 # WebSocket load generator
 swift run -c release oria-bench echo      ws://127.0.0.1:3000/ws/echo 256 10        # round trips
@@ -387,11 +603,19 @@ h2load -D 10 -c 64 -m 32 https://127.0.0.1:3443/json
 ```
 
 Example app environment variables: `PORT`, `THREADS`, `LOG=1`, `COMPRESSION=1`, `REUSE_PORT=1`,
-`STATIC_DIR=./public`, `RATE_LIMIT`, `EVENT_LOOP_EXECUTOR=1`, `TLS_CERT` + `TLS_KEY`. Its routes include
-`/ws/echo` and `/ws/chat/:room`.
+`STATIC_DIR=./public`, `FILES_DIR`, `MAX_BODY`, `RATE_LIMIT`, `BENCH=1` (skip demo middleware),
+`HANDLERS_ON_LOOP=0`, `EVENT_LOOP_EXECUTOR=1`, `TLS_CERT` + `TLS_KEY`.
+
+Its routes include:
+
+- `/ws/echo` and `/ws/chat/:room` (WebSockets)
+- `POST /upload` (multipart)
+- `PUT` / `GET /files/:name` (raw upload, then a ranged download)
+- `GET /bytes/:count` (a large generated response)
+- `POST /sink` (a streamed body that is discarded)
 
 ## Not implemented yet
 
 Cleartext HTTP/2 (h2c; browsers only use HTTP/2 over TLS anyway), WebSockets over HTTP/2 (RFC 8441;
-browsers fall back to HTTP/1.1), WebSocket compression (permessage-deflate), HTTP/3, multipart
-uploads, range requests, view templates.
+browsers fall back to HTTP/1.1), WebSocket compression (permessage-deflate), HTTP/3, `sendfile(2)`
+zero-copy for plaintext file responses, built-in metrics, view templates.
