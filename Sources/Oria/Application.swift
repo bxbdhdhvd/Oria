@@ -40,6 +40,21 @@ public final class Oria: Router, @unchecked Sendable {
         public var serverName: String? = nil
         /// Install SIGINT/SIGTERM handlers that trigger a graceful shutdown in `listen`.
         public var handleSignals = true
+        /// Serve HTTPS. With TLS enabled, clients negotiate HTTP/2 or HTTP/1.1 via ALPN.
+        public var tls: TLSOptions? = nil
+        /// Offer HTTP/2 to TLS clients (browsers only use HTTP/2 over TLS).
+        public var http2 = true
+        /// Maximum concurrent HTTP/2 streams per connection.
+        public var http2MaxConcurrentStreams = 100
+        /// Time allowed to receive a complete request (headers and body), measured from the end of
+        /// the previous response or from connection open (including the TLS handshake). Defeats
+        /// slowloris-style clients that dribble bytes to dodge `idleTimeout`. This also bounds how
+        /// long an idle keep-alive connection stays open.
+        public var requestReadTimeout: TimeAmount? = .seconds(30)
+        /// Maximum combined size of the request line and headers (`431`/`400` above it).
+        public var maxHeaderSize = 16 * 1024
+        /// Maximum number of request headers.
+        public var maxHeaderCount = 200
 
         public init() {}
     }
@@ -148,11 +163,33 @@ public final class Oria: Router, @unchecked Sendable {
         if let route = match?.0 {
             terminal = route.handler
             routeMiddleware = route.middleware
+        } else if router.matchWebSocket(segments: segments) != nil {
+            terminal = Oria.upgradeRequired
+            routeMiddleware = []
         } else {
             terminal = router.notFound
             routeMiddleware = []
         }
+        await runChain(req, res, router: router, segments: segments, routeMiddleware: routeMiddleware, terminal: terminal)
+    }
 
+    /// Runs the middleware for a WebSocket route before upgrading. Returns true if every middleware
+    /// called `next()` without responding; otherwise `res` holds the response to send instead.
+    func authorizeUpgrade(
+        _ req: Request, _ res: Response, router: CompiledRouter, route: CompiledRouter.WebSocketRoute
+    ) async -> Bool {
+        let segments = req.path.split(separator: "/", omittingEmptySubsequences: true)
+        let allowed = NIOLockedValueBox(false)
+        await runChain(req, res, router: router, segments: segments, routeMiddleware: route.middleware) { _, res in
+            if !res.isSent { allowed.withLockedValue { $0 = true } }
+        }
+        return allowed.withLockedValue { $0 } && !res.isSent
+    }
+
+    private func runChain(
+        _ req: Request, _ res: Response, router: CompiledRouter, segments: [Substring],
+        routeMiddleware: [Middleware], terminal: @escaping Handler
+    ) async {
         do {
             if router.hasScopedMiddleware {
                 let scoped = router.middleware(for: segments)
@@ -192,6 +229,11 @@ public final class Oria: Router, @unchecked Sendable {
         try await mw(req, res) {
             try await runScoped(scoped, index + 1, routeMiddleware, terminal, req, res)
         }
+    }
+
+    static let upgradeRequired: Handler = { _, res in
+        res.status(.upgradeRequired).set("upgrade", "websocket")
+        try res.json(["error": "This endpoint requires a WebSocket upgrade"])
     }
 
     static let defaultNotFound: Handler = { req, res in

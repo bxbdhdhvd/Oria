@@ -21,6 +21,37 @@ public func logger(
     }
 }
 
+// MARK: - Security headers
+
+public struct SecurityHeadersOptions: Sendable {
+    /// `Content-Security-Policy`. nil omits it (set one tailored to your front end).
+    public var contentSecurityPolicy: String? = "default-src 'self'; frame-ancestors 'none'; object-src 'none'"
+    /// `Strict-Transport-Security` max-age in seconds; sent only on HTTPS requests. nil disables it.
+    public var hstsMaxAge: Int? = 15_552_000
+    public var frameOptions: String? = "DENY"
+    public var referrerPolicy: String? = "no-referrer"
+    public var crossOriginOpenerPolicy: String? = "same-origin"
+    public init() {}
+}
+
+/// Sets defensive response headers, like `helmet()`.
+public func securityHeaders(_ options: SecurityHeadersOptions = .init()) -> Middleware {
+    { req, res, next in
+        res.set("x-content-type-options", "nosniff")
+        res.set("x-dns-prefetch-control", "off")
+        res.set("x-download-options", "noopen")
+        res.set("x-permitted-cross-domain-policies", "none")
+        if let csp = options.contentSecurityPolicy { res.set("content-security-policy", csp) }
+        if let frame = options.frameOptions { res.set("x-frame-options", frame) }
+        if let referrer = options.referrerPolicy { res.set("referrer-policy", referrer) }
+        if let coop = options.crossOriginOpenerPolicy { res.set("cross-origin-opener-policy", coop) }
+        if let maxAge = options.hstsMaxAge, req.isSecure {
+            res.set("strict-transport-security", "max-age=\(maxAge); includeSubDomains")
+        }
+        try await next()
+    }
+}
+
 // MARK: - CORS
 
 public struct CORSOptions: Sendable {

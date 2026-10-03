@@ -14,6 +14,7 @@ open class Router: @unchecked Sendable {
         case middleware(path: String, Middleware)
         case route(method: String, path: String, [Middleware], Handler)
         case mount(path: String, Router)
+        case websocket(path: String, [Middleware], WebSocketOptions, WebSocketHandler)
     }
 
     private let lock = NIOLock()
@@ -22,7 +23,7 @@ open class Router: @unchecked Sendable {
 
     public init() {}
 
-    private func add(_ layer: Layer) {
+    func add(_ layer: Layer) {
         lock.withLock {
             layers.append(layer)
             version &+= 1
@@ -292,6 +293,10 @@ open class Router: @unchecked Sendable {
                 builder.addRoute(method: method, segments: prefix + Router.segments(path), middleware: mws, handler: handler)
             case .mount(let path, let router):
                 router.flatten(prefix: prefix + Router.segments(path), into: &builder, depth: depth + 1)
+            case .websocket(let path, let mws, let options, let handler):
+                builder.addWebSocket(
+                    segments: prefix + Router.segments(path), middleware: mws, options: options, handler: handler
+                )
             }
         }
     }
@@ -316,18 +321,47 @@ final class CompiledRouter: Sendable {
         let handler: Handler
     }
 
+    struct WebSocketRoute: Sendable {
+        let paramNames: [String]
+        let middleware: [Middleware]
+        let options: WebSocketOptions
+        let handler: WebSocketHandler
+    }
+
     final class Node: @unchecked Sendable {
         var statics: [String: Node] = [:]
         var param: Node?
         var wildcard: Node?
         var routes: [String: Route] = [:]
+        var websocket: WebSocketRoute?
     }
 
     struct Builder {
         var middleware: [ScopedMiddleware] = []
+        var maxWebSocketFrameSize = 0
         let root = Node()
 
         mutating func addRoute(method: String, segments: [String], middleware: [Middleware], handler: @escaping Handler) {
+            let (node, names) = walk(segments)
+            // First registration wins, like Express.
+            if node.routes[method] == nil {
+                node.routes[method] = Route(paramNames: names, middleware: middleware, handler: handler)
+            }
+        }
+
+        mutating func addWebSocket(
+            segments: [String], middleware: [Middleware], options: WebSocketOptions, handler: @escaping WebSocketHandler
+        ) {
+            let (node, names) = walk(segments)
+            maxWebSocketFrameSize = max(maxWebSocketFrameSize, options.maxFrameSize)
+            if node.websocket == nil {
+                node.websocket = WebSocketRoute(
+                    paramNames: names, middleware: middleware, options: options, handler: handler
+                )
+            }
+        }
+
+        private func walk(_ segments: [String]) -> (Node, [String]) {
             var node = root
             var names: [String] = []
             for (i, seg) in segments.enumerated() {
@@ -350,10 +384,7 @@ final class CompiledRouter: Sendable {
                     }
                 }
             }
-            // First registration wins, like Express.
-            if node.routes[method] == nil {
-                node.routes[method] = Route(paramNames: names, middleware: middleware, handler: handler)
-            }
+            return (node, names)
         }
     }
 
@@ -363,10 +394,13 @@ final class CompiledRouter: Sendable {
     let root: Node
     let notFound: Handler
     let errorHandler: ErrorHandler
+    /// Largest frame any WebSocket route accepts; 0 when there are no WebSocket routes.
+    let maxWebSocketFrameSize: Int
 
     init(_ builder: Builder, notFound: @escaping Handler, errorHandler: @escaping ErrorHandler) {
         self.notFound = notFound
         self.errorHandler = errorHandler
+        self.maxWebSocketFrameSize = builder.maxWebSocketFrameSize
         self.root = builder.root
         self.scopedMiddleware = builder.middleware
         self.hasScopedMiddleware = builder.middleware.contains { !$0.prefix.isEmpty }
@@ -375,53 +409,64 @@ final class CompiledRouter: Sendable {
 
     /// Finds the route for a method + path. Static segments win over `:params`, which win over `*`.
     func match(method: String, segments: [Substring]) -> (Route, [String: String])? {
-        var values: [Substring] = []
-        values.reserveCapacity(4)
-        guard let route = Self.match(root, segments[...], method: method, values: &values) else { return nil }
-        var params: [String: String] = [:]
-        if !route.paramNames.isEmpty {
-            params.reserveCapacity(route.paramNames.count)
-            for (name, value) in zip(route.paramNames, values) {
-                params[name] = value.contains("%") ? (value.removingPercentEncoding ?? String(value)) : String(value)
-            }
-        }
-        return (route, params)
+        Self.lookup(root, segments) { node in
+            if let r = node.routes[method] ?? node.routes[Self.anyMethod] { return r }
+            if method == "HEAD" { return node.routes["GET"] }
+            return nil
+        }.map { ($0.0, Self.params($0.0.paramNames, $0.1)) }
     }
 
-    private static func match(
-        _ node: Node, _ segments: ArraySlice<Substring>, method: String, values: inout [Substring]
-    ) -> Route? {
+    /// Finds the WebSocket route for a path.
+    func matchWebSocket(segments: [Substring]) -> (WebSocketRoute, [String: String])? {
+        Self.lookup(root, segments) { $0.websocket }.map { ($0.0, Self.params($0.0.paramNames, $0.1)) }
+    }
+
+    private static func params(_ names: [String], _ values: [Substring]) -> [String: String] {
+        guard !names.isEmpty else { return [:] }
+        var params: [String: String] = [:]
+        params.reserveCapacity(names.count)
+        for (name, value) in zip(names, values) {
+            params[name] = value.contains("%") ? (value.removingPercentEncoding ?? String(value)) : String(value)
+        }
+        return params
+    }
+
+    private static func lookup<R>(
+        _ root: Node, _ segments: [Substring], _ pick: (Node) -> R?
+    ) -> (R, [Substring])? {
+        var values: [Substring] = []
+        values.reserveCapacity(4)
+        guard let r = match(root, segments[...], pick, &values) else { return nil }
+        return (r, values)
+    }
+
+    private static func match<R>(
+        _ node: Node, _ segments: ArraySlice<Substring>, _ pick: (Node) -> R?, _ values: inout [Substring]
+    ) -> R? {
         guard let seg = segments.first else {
-            if let r = node.routes[method] ?? node.routes[anyMethod] { return r }
-            if method == "HEAD", let r = node.routes["GET"] { return r }
+            if let r = pick(node) { return r }
             // Allow `/files/*` to match `/files` with an empty wildcard.
-            if let wc = node.wildcard, let r = routeFor(wc, method) {
+            if let wc = node.wildcard, let r = pick(wc) {
                 values.append("")
                 return r
             }
             return nil
         }
         let rest = segments.dropFirst()
-        if let next = node.statics[String(seg)], let r = match(next, rest, method: method, values: &values) {
+        if let next = node.statics[String(seg)], let r = match(next, rest, pick, &values) {
             return r
         }
         if let next = node.param {
             values.append(seg)
-            if let r = match(next, rest, method: method, values: &values) { return r }
+            if let r = match(next, rest, pick, &values) { return r }
             values.removeLast()
         }
-        if let wc = node.wildcard, let r = routeFor(wc, method) {
+        if let wc = node.wildcard, let r = pick(wc) {
             let start = seg.startIndex
             let end = segments.last!.endIndex
             values.append(seg.base[start..<end])
             return r
         }
-        return nil
-    }
-
-    private static func routeFor(_ node: Node, _ method: String) -> Route? {
-        if let r = node.routes[method] ?? node.routes[anyMethod] { return r }
-        if method == "HEAD" { return node.routes["GET"] }
         return nil
     }
 

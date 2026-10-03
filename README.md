@@ -1,7 +1,8 @@
 # Oria
 
 An Express.js-style web framework for Swift, built on [SwiftNIO](https://github.com/apple/swift-nio).
-If you know Express, you already know Oria. It runs on every CPU core from a single process.
+If you know Express, you already know Oria. It runs on every CPU core from a single process and
+speaks HTTP/1.1, HTTP/2 and WebSockets, over plain TCP or TLS.
 
 ```swift
 import Oria
@@ -19,6 +20,12 @@ app.get("/users/:id") { req, res in
     try res.json(["id": req.params["id"]])
 }
 
+app.ws("/chat") { req, ws in
+    for await case .text(let text) in ws.messages {
+        try await ws.send("echo: \(text)")
+    }
+}
+
 try await app.listen(3000)
 ```
 
@@ -31,18 +38,29 @@ try await app.listen(3000)
 | Handlers | callbacks | `async`/`await`, `throws` |
 | Request bodies | needs `express.json()` | `try req.json(MyType.self)`, typed `Codable` |
 | Backpressure | manual | end-to-end via `NIOAsyncChannel` |
+| HTTP/2, TLS | separate modules (`http2`, `https`, `spdy`) | built in: `config.tls = ...` gives HTTPS + HTTP/2 via ALPN |
+| WebSockets | `ws` / `express-ws` packages | built in: `app.ws(...)`, rooms with non-blocking broadcast |
 
-**Benchmarks** (same 4-vCPU Linux VM, `wrk -t2` running on the same machine, release build, no logging):
+**Benchmarks** (one 4-vCPU Linux VM, release build, no logging; the load generator runs on the same
+machine and competes for CPU, so treat these as relative numbers):
 
-| Endpoint | Express 4 (1 process) | Oria (1 process) |
-|---|---|---|
-| `GET /` plaintext, 256 conns | 10.3k req/s, p99 923 ms | **74.3k req/s, p99 8.5 ms** |
-| `GET /json`, 256 conns | 10.0k req/s, p99 354 ms | **68.1k req/s, p99 9.5 ms** |
-| `GET /api/users/:id` (router + rate limiter + actor), 256 conns | - | **60.0k req/s, p99 10.1 ms** |
-| `GET /` plaintext, 1000 conns, 30 s | - | **75.5k req/s, p99 31 ms**, 0 timeouts |
+| Workload | Tool | Express 4 | Oria |
+|---|---|---|---|
+| HTTP/1.1 `GET /` plaintext, 256 conns | wrk | 10.3k req/s, p99 923 ms | **70.3k req/s**, p99 9.7 ms |
+| HTTP/1.1 `GET /json`, 256 conns | wrk | 10.0k req/s, p99 354 ms | **64.2k req/s**, p99 10.3 ms |
+| HTTPS (HTTP/1.1 over TLS) `GET /json`, 256 conns | wrk | - | **58.5k req/s**, p99 11 ms |
+| HTTP/2 over TLS `GET /json`, 64 conns × 32 streams | h2load | - | **54.3k req/s**, 0 failed |
+| HTTP/2 router + rate limiter + actor, 64 × 32 | h2load | - | **42.2k req/s** |
+| HTTP/2 `POST` JSON body, 16 × 100 | h2load | - | **40.8k req/s** |
+| WebSocket echo round trips, 256 conns (32 B) | oria-bench | - | **67.4k msg/s**, p99 8.7 ms |
+| WebSocket echo round trips, 1000 conns | oria-bench | - | **65.2k msg/s**, p99 33 ms |
+| WebSocket echo, 100 conns × 16 KB | oria-bench | - | **30.5k msg/s** (≈500 MB/s each way) |
+| WebSocket broadcast, 1 sender → 1000 receivers | oria-bench | - | **75k deliveries/s**, p99 80 ms |
+| Idle WebSockets held open | oria-bench | - | **10,000** at ~25 KB each; HTTP still 59k req/s alongside |
 
-Memory: ~40 MB RSS under load. Reproduce with `scripts/bench.sh`. Treat these as relative numbers,
-since the load generator competes with the server for CPU.
+Reproduce with `scripts/bench.sh` (HTTP/1.1), `h2load` (HTTP/2) and `oria-bench` (WebSockets; see
+below). Broadcast capacity on this machine tops out around 130k deliveries/s; offering more than
+that grows latency (queued, not dropped).
 
 ## Install
 
@@ -178,6 +196,78 @@ app.onError { error, req, res in ... }
 app.notFound { req, res in res.status(404).send("Nope") }
 ```
 
+### WebSockets
+
+```swift
+app.ws("/echo") { req, ws in
+    for await message in ws.messages {          // ends when the socket closes
+        switch message {
+        case .text(let text):   try await ws.send(text)
+        case .binary(let data): try await ws.send(data)
+        }
+    }
+}                                               // returning closes the socket (1000)
+
+// Route params, query, cookies, headers: `req` is the upgrade request.
+app.ws("/rooms/:room", requireAuth) { req, ws in ... }   // middleware runs *before* the upgrade
+
+try await ws.send(json: event)                 // any Encodable as a text frame
+await ws.close(code: .policyViolation, reason: "bye")
+```
+
+- **Middleware gates the upgrade.** Global and route middleware run before the `101 Switching
+  Protocols` response. If one responds (e.g. 401) instead of calling `next()`, the client gets that
+  response and no socket opens. Headers middleware sets (cookies, for example) go out with the `101`.
+- **Plain requests** to a WebSocket path get `426 Upgrade Required`.
+- **Lifecycle:** the server answers pings, pings idle clients (`pingInterval`, default 30 s) and drops
+  peers silent for two intervals. Throwing from the handler closes with 1011. On shutdown clients get
+  1001 ("going away").
+
+**Broadcasting / rooms.** `ws.send` waits for the socket (backpressure), so don't `await` many sockets
+in a loop: one slow phone would stall everyone. Use the non-blocking `WebSocketHub` (or
+`ws.enqueue(_:)`):
+
+```swift
+let hub = WebSocketHub()
+
+app.ws("/chat/:room") { req, ws in
+    let room = req.params["room"]!
+    hub.join(room, ws)
+    defer { hub.leave(room, ws) }
+    for await case .text(let text) in ws.messages {
+        hub.broadcast(text, to: room)           // encodes once, queues on every member, returns at once
+    }
+}
+```
+
+Each socket gets a bounded outbox (`outboxLimit`, default 1024 messages). A client that falls that far
+behind is disconnected instead of buffering without limit.
+
+`WebSocketOptions` per route: `maxFrameSize`, `maxMessageSize` (both 1 MiB), `allowedOrigins`,
+`protocols` (subprotocol negotiation), `pingInterval`, `closeTimeout`, `messageBuffer`, `outboxLimit`.
+
+> **Set `allowedOrigins` for browser apps that rely on cookies.** Browsers don't apply CORS to
+> WebSockets, so without it any website can open a socket with your user's cookies (cross-site
+> WebSocket hijacking).
+
+### HTTPS and HTTP/2
+
+```swift
+var config = Oria.Configuration()
+config.tls = try .files(certificateChain: "fullchain.pem", privateKey: "privkey.pem")
+// or: try .pem(certificateChain: certString, privateKey: keyString)
+// or: TLSOptions(configuration: myNIOSSLConfiguration)   // mTLS, custom ciphers, ...
+let app = Oria(configuration: config)
+try await app.listen(443)
+```
+
+With TLS on, clients negotiate HTTP/2 or HTTP/1.1 via ALPN. Your routes and middleware don't change:
+every HTTP/2 stream becomes the same `Request`/`Response`. `wss://` works the same as `ws://`
+(browsers open WebSockets over HTTP/1.1). Only TLS 1.2 and 1.3 are accepted. `req.isSecure` is true
+on TLS connections (or behind a trusted proxy sending `X-Forwarded-Proto: https`). Set
+`config.http2 = false` to offer only HTTP/1.1, and `config.http2MaxConcurrentStreams` (default 100)
+to cap streams per connection.
+
 ### Built-in middleware
 
 | Middleware | Express equivalent |
@@ -186,6 +276,7 @@ app.notFound { req, res in res.status(404).send("Nope") }
 | `cors(CORSOptions(...))` | `cors()`. Handles preflight requests. |
 | `serveStatic("./public", StaticOptions(...))` | `express.static()`. Non-blocking, streamed, ETag/304 support, blocks path traversal and dotfiles. |
 | `rateLimit(max:window:key:)` | `express-rate-limit`. Sharded fixed window, sets `RateLimit-*` and `Retry-After`. |
+| `securityHeaders(SecurityHeadersOptions())` | `helmet()`. `nosniff`, `X-Frame-Options`, CSP, `Referrer-Policy`, COOP, and HSTS on HTTPS. |
 
 Body parsing needs no middleware: use `req.json`, `req.form` or `req.text`.
 
@@ -202,6 +293,11 @@ config.compression = true                  // gzip/deflate when the client accep
 config.reusePort = true                    // SO_REUSEPORT: run N processes on one port
 config.trustProxy = true                   // behind nginx / a load balancer
 config.shutdownGracePeriod = .seconds(10)
+config.requestReadTimeout = .seconds(30)   // full request must arrive in time (slowloris / slow bodies)
+config.maxHeaderSize = 16 * 1024           // request line + headers (431/400 above)
+config.maxHeaderCount = 200
+config.tls = try .files(certificateChain: "cert.pem", privateKey: "key.pem")
+config.http2 = true                        // with TLS: HTTP/2 via ALPN
 let app = Oria(configuration: config)
 ```
 
@@ -212,15 +308,47 @@ How one process scales:
 - **Backpressure.** Each connection is a structured-concurrency task over `NIOAsyncChannel`, so a slow
   client can't make the server buffer unbounded data. Large accept buffers keep new connections
   flowing under load.
-- **Graceful shutdown.** On SIGINT/SIGTERM the server stops accepting, closes idle keep-alive
-  connections immediately, lets in-flight requests finish (responding with `Connection: close`), and
-  force-closes whatever is left after `shutdownGracePeriod`. Connections caught mid-accept during
-  shutdown are closed, not leaked. This is covered by a stress test.
+- **Cheap HTTP/2 streams.** Each stream is collected on its event loop and dispatched to one task, with
+  no per-stream async-channel machinery (2.5× faster than wrapping every stream).
+- **Graceful shutdown.** On SIGINT/SIGTERM the server stops accepting and closes idle keep-alive
+  connections at once. In-flight HTTP/1.1 requests and HTTP/2 streams finish (HTTP/1.1 responses carry
+  `Connection: close`), WebSockets get a 1001 close frame, and anything left is force-closed after
+  `shutdownGracePeriod`. Responses are fully written before a socket closes. Connections caught
+  mid-accept or mid-handshake are closed, not leaked or left hanging. Covered by stress tests, plus a
+  SIGTERM-under-mixed-load chaos run (10/10 clean exits).
+- **Memory.** Live heap returns to baseline after load: 100k WebSockets opened and closed left ~13 MB
+  in use. glibc keeps freed memory in per-thread arenas, so RSS can sit above that. If that matters,
+  run with `MALLOC_ARENA_MAX=2` or a different allocator.
 - **Optional: handlers on the I/O threads.** Call `Oria.runConcurrencyOnEventLoops()` as the first line
   of `main.swift` to make Swift Concurrency run on the event loops. This removes a thread hop per
   read and write. In our tests it lowered tail latency for routes that await actors at very high
   connection counts, but reduced throughput on the same routes. Benchmark your own workload
   before enabling it.
+
+## Security
+
+These defenses are on by default and covered by tests that attack a real socket:
+
+| Attack | Behavior |
+|---|---|
+| Request smuggling (CL + TE, duplicate/conflicting `Content-Length`, obfuscated `Transfer-Encoding`, bad chunk sizes) | `400` and the connection closes; the smuggled request never reaches a handler |
+| Header, URL and header-count bombs | `431`/`400` (`maxHeaderSize`, `maxHeaderCount`) |
+| Huge or endless bodies, including chunked | `413` (`maxBodySize`) |
+| Slowloris (dribbled headers) and slow-body uploads | closed after `requestReadTimeout`; truncated bodies never reach handlers |
+| Garbage / non-HTTP input, unknown methods, bad versions | `400` and an immediate close |
+| Response splitting (CR/LF in a header value, e.g. `res.redirect(userInput)`) | refused, `500` instead |
+| Parameter flooding | only the first 1000 query/form parameters are parsed |
+| Deeply nested JSON | `400` (decoder depth limit), no crash |
+| `Upgrade: h2c` or other unknown upgrades | served as normal HTTP (NIO would otherwise drop the request) |
+| HTTP/2 rapid reset (CVE-2023-44487), HPACK header bombs | `GOAWAY` and the connection closes; other clients unaffected |
+| TLS 1.0 / 1.1 | handshake refused |
+| WebSocket: unmasked frames / invalid UTF-8 / oversized frames or messages | close `1002` / `1007` / `1009` |
+| Cross-site WebSocket hijacking | `403` when `allowedOrigins` is set |
+| Path traversal in `serveStatic` | `403`; dotfiles hidden |
+| Slow WebSocket consumers in a broadcast | disconnected after `outboxLimit`; never stall others |
+
+Not handled for you: authentication, CSRF tokens for cookie-authenticated forms, and per-user rate
+limits beyond `rateLimit`'s IP key. Put Oria behind a load balancer if you need DDoS absorption.
 
 ## Testing your app
 
@@ -245,15 +373,25 @@ Read it from `server.port` and call `await server.shutdown()` when done.
 
 ```bash
 swift build
-swift test                                   # 39 unit + end-to-end tests
+swift test                                   # 86 tests: routing, HTTP/1, HTTP/2, TLS, WebSockets, attacks
 swift run -c release oria-example            # example app on :3000
-scripts/bench.sh 256 10s                     # load test (needs wrk)
+scripts/bench.sh 256 10s                     # HTTP/1.1 load test (needs wrk)
+
+# WebSocket load generator
+swift run -c release oria-bench echo      ws://127.0.0.1:3000/ws/echo 256 10        # round trips
+swift run -c release oria-bench broadcast ws://127.0.0.1:3000/ws/chat/r 1000 200    # fan-out
+swift run -c release oria-bench idle      ws://127.0.0.1:3000/ws/echo 10000 30      # capacity
+
+# HTTP/2 (TLS_CERT/TLS_KEY enable HTTPS in the example)
+h2load -D 10 -c 64 -m 32 https://127.0.0.1:3443/json
 ```
 
 Example app environment variables: `PORT`, `THREADS`, `LOG=1`, `COMPRESSION=1`, `REUSE_PORT=1`,
-`STATIC_DIR=./public`, `RATE_LIMIT`, `EVENT_LOOP_EXECUTOR=1`.
+`STATIC_DIR=./public`, `RATE_LIMIT`, `EVENT_LOOP_EXECUTOR=1`, `TLS_CERT` + `TLS_KEY`. Its routes include
+`/ws/echo` and `/ws/chat/:room`.
 
 ## Not implemented yet
 
-HTTP/2, TLS (terminate at a reverse proxy or load balancer for now), WebSockets, multipart
+Cleartext HTTP/2 (h2c; browsers only use HTTP/2 over TLS anyway), WebSockets over HTTP/2 (RFC 8441;
+browsers fall back to HTTP/1.1), WebSocket compression (permessage-deflate), HTTP/3, multipart
 uploads, range requests, view templates.

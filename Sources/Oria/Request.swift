@@ -28,6 +28,8 @@ public final class Request: @unchecked Sendable {
     public var locals: [String: any Sendable] = [:]
 
     let trustProxy: Bool
+    /// Whether the request arrived over TLS (or via a trusted proxy reporting `X-Forwarded-Proto: https`).
+    public internal(set) var isSecure = false
 
     init(
         head: HTTPRequestHead,
@@ -50,6 +52,9 @@ public final class Request: @unchecked Sendable {
             self.queryString = nil
         }
         self.subpath = self.path
+        if trustProxy, head.headers.first(name: "x-forwarded-proto")?.lowercased() == "https" {
+            self.isSecure = true
+        }
     }
 
     /// Returns the first value of a header (case-insensitive).
@@ -131,10 +136,15 @@ public final class Request: @unchecked Sendable {
         return ct.contains(type.lowercased())
     }
 
+    /// Parameters beyond this are ignored (like Express' `qs`), bounding the work an attacker can force.
+    static let maxParameters = 1000
+
     static func parseURLEncoded(_ string: String) -> [(String, String)] {
         guard !string.isEmpty else { return [] }
         var out: [(String, String)] = []
-        for pair in string.split(separator: "&", omittingEmptySubsequences: true) {
+        for pair in string.split(separator: "&", maxSplits: maxParameters, omittingEmptySubsequences: true)
+            .prefix(maxParameters)
+        {
             let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
             let key = decodeComponent(parts[0])
             let value = parts.count > 1 ? decodeComponent(parts[1]) : ""

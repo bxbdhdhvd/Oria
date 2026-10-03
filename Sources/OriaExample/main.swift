@@ -32,6 +32,10 @@ var config = Oria.Configuration()
 if let threads = env["THREADS"].flatMap(Int.init) { config.threads = threads }
 config.compression = env["COMPRESSION"] == "1"
 config.reusePort = env["REUSE_PORT"] == "1"
+// HTTPS + HTTP/2: TLS_CERT=cert.pem TLS_KEY=key.pem
+if let cert = env["TLS_CERT"], let key = env["TLS_KEY"] {
+    config.tls = try .files(certificateChain: cert, privateKey: key)
+}
 
 let app = Oria(configuration: config)
 let store = UserStore()
@@ -87,6 +91,28 @@ app.get("/stream") { _, res in
             try await writer.write("data: tick \(i)\n\n")
             try await Task.sleep(for: .milliseconds(100))
         }
+    }
+}
+
+// WebSockets.
+app.ws("/ws/echo") { _, ws in
+    for await message in ws.messages {
+        switch message {
+        case .text(let text): try await ws.send(text)
+        case .binary(let data): try await ws.send(data)
+        }
+    }
+}
+
+// Chat rooms: WebSocketHub broadcasts without blocking, so a slow client can't stall a room.
+let chat = WebSocketHub()
+
+app.ws("/ws/chat/:room") { req, ws in
+    let room = req.params["room"]!
+    chat.join(room, ws)
+    defer { chat.leave(room, ws) }
+    for await message in ws.messages {
+        if case .text(let text) = message { chat.broadcast(text, to: room) }
     }
 }
 

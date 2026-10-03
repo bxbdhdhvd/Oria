@@ -1,4 +1,5 @@
 import Foundation
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOHTTP1
 import NIOPosix
@@ -8,6 +9,16 @@ import Testing
 
 /// End-to-end tests over real TCP sockets.
 @Suite struct ServerTests {
+    let slowStarted = NIOLockedValueBox(0)
+
+    /// Waits until the /slow handler is running, so a shutdown is guaranteed to hit it mid-flight.
+    func waitForSlowRequest() async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while slowStarted.withLockedValue({ $0 }) == 0 && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
     struct ClientResponse {
         var head: HTTPResponseHead
         var body: String
@@ -78,7 +89,9 @@ import Testing
         configure(&config)
         let app = Oria(configuration: config)
         app.get("/") { _, res in res.send("hello") }
+        let started = slowStarted
         app.get("/slow") { _, res in
+            started.withLockedValue { $0 += 1 }
             try await Task.sleep(for: .milliseconds(300))
             res.send("finished")
         }
@@ -104,6 +117,26 @@ import Testing
         #expect(responses[0].head.headers.first(name: "date") != nil)
         #expect(responses[0].head.headers.first(name: "content-length") == "5")
         #expect(responses[0].head.headers.first(name: "connection") == nil)
+        await server.shutdown()
+    }
+
+    /// Regression: closing right after writing used to discard bytes still queued in NIO, silently
+    /// truncating large responses sent with `Connection: close` (HTTP/1.0, errors, shutdown).
+    @Test func largeResponsesSurviveConnectionClose() async throws {
+        let app = makeApp()
+        let size = 32 * 1024 * 1024
+        let payload = ByteBuffer(repeating: UInt8(ascii: "z"), count: size)
+        app.get("/huge") { _, res in res.send(payload) }
+        let server = try await app.start(port: 0, host: "127.0.0.1")
+        for _ in 0..<3 {
+            let client = try await RawClient.connect(port: server.port!)
+            try await client.send("GET /huge HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            #expect(await client.waitForClose(timeout: .seconds(20)))
+            let received = client.collector.buffer.withLockedValue { $0.readableBytes }
+            let head = String(client.text.prefix(300))
+            let headLength = head.range(of: "\r\n\r\n").map { head.utf8.distance(from: head.startIndex, to: $0.upperBound) } ?? 0
+            #expect(received - headLength == size, "body must arrive complete before the close")
+        }
         await server.shutdown()
     }
 
@@ -198,7 +231,7 @@ import Testing
         let idle = try await Self.connect(port)
 
         async let slow = Self.get("/slow", port: port)
-        try await Task.sleep(for: .milliseconds(100))
+        try await waitForSlowRequest()
 
         let clock = ContinuousClock()
         let started = clock.now
