@@ -43,7 +43,7 @@ let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
 
 func connect(_ target: Target) async throws -> WS {
     let upgrade = try await ClientBootstrap(group: group)
-        .channelOption(.socketOption(.tcp_nodelay), value: 1)
+        .channelOption(.tcpOption(.tcp_nodelay), value: 1)
         .connect(host: target.host, port: target.port) { channel in
             channel.eventLoop.makeCompletedFuture {
                 let upgrader = NIOTypedWebSocketClientUpgrader<Upgrade>(maxFrameSize: 1 << 24) { channel, _ in

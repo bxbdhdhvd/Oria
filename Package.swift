@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "Oria",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v15)],
     products: [
         .library(name: "Oria", targets: ["Oria"]),
         .executable(name: "oria-example", targets: ["OriaExample"]),

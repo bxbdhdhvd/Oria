@@ -15,6 +15,7 @@ open class Router: @unchecked Sendable {
         case route(method: String, path: String, [Middleware], Handler)
         case mount(path: String, Router)
         case websocket(path: String, [Middleware], WebSocketOptions, WebSocketHandler)
+        case upload(method: String, path: String, [Middleware], UploadOptions, Handler)
     }
 
     private let lock = NIOLock()
@@ -281,6 +282,40 @@ open class Router: @unchecked Sendable {
         all(path, middleware: [m1, m2, m3], handler: handler)
     }
 
+    // MARK: Uploads
+
+    /// Registers a route whose body streams to disk instead of memory, with its own limits. Use it
+    /// for file uploads of any size: memory stays flat, and the handler runs once the whole body
+    /// has arrived.
+    ///
+    /// - `multipart/form-data` bodies: `req.uploads` holds the text fields and the files (temporary
+    ///   files, deleted after the response unless you `move(to:)` them).
+    /// - Any other content type: `req.uploadedBody` is the whole body in one temporary file.
+    ///
+    /// ```swift
+    /// app.upload("/avatars", options: .init(maxFileSize: 10 << 20, allowedFileTypes: ["image/png"])) { req, res in
+    ///     let file = req.uploads!.file("avatar")!
+    ///     try await file.move(to: "/srv/avatars/\(UUID()).png")
+    ///     res.status(.created).send("ok")
+    /// }
+    /// ```
+    @discardableResult
+    public func upload(
+        _ path: String, method: HTTPMethod = .POST, options: UploadOptions = .init(), middleware: [Middleware] = [],
+        handler: @escaping Handler
+    ) -> Self {
+        add(.upload(method: method.rawValue, path: path, middleware, options, handler))
+        return self
+    }
+
+    @discardableResult
+    public func upload(
+        _ path: String, _ m1: @escaping Middleware, method: HTTPMethod = .POST, options: UploadOptions = .init(),
+        handler: @escaping Handler
+    ) -> Self {
+        upload(path, method: method, options: options, middleware: [m1], handler: handler)
+    }
+
     // MARK: Compilation
 
     func flatten(prefix: [String], into builder: inout CompiledRouter.Builder, depth: Int = 0) {
@@ -293,6 +328,11 @@ open class Router: @unchecked Sendable {
                 builder.addRoute(method: method, segments: prefix + Router.segments(path), middleware: mws, handler: handler)
             case .mount(let path, let router):
                 router.flatten(prefix: prefix + Router.segments(path), into: &builder, depth: depth + 1)
+            case .upload(let method, let path, let mws, let options, let handler):
+                builder.addRoute(
+                    method: method, segments: prefix + Router.segments(path), middleware: mws, handler: handler,
+                    upload: options
+                )
             case .websocket(let path, let mws, let options, let handler):
                 builder.addWebSocket(
                     segments: prefix + Router.segments(path), middleware: mws, options: options, handler: handler
@@ -319,6 +359,8 @@ final class CompiledRouter: Sendable {
         let paramNames: [String]
         let middleware: [Middleware]
         let handler: Handler
+        /// Set for `upload(...)` routes: the body streams to disk with these limits.
+        var upload: UploadOptions? = nil
     }
 
     struct WebSocketRoute: Sendable {
@@ -339,13 +381,18 @@ final class CompiledRouter: Sendable {
     struct Builder {
         var middleware: [ScopedMiddleware] = []
         var maxWebSocketFrameSize = 0
+        var hasUploadRoutes = false
         let root = Node()
 
-        mutating func addRoute(method: String, segments: [String], middleware: [Middleware], handler: @escaping Handler) {
+        mutating func addRoute(
+            method: String, segments: [String], middleware: [Middleware], handler: @escaping Handler,
+            upload: UploadOptions? = nil
+        ) {
             let (node, names) = walk(segments)
+            if upload != nil { hasUploadRoutes = true }
             // First registration wins, like Express.
             if node.routes[method] == nil {
-                node.routes[method] = Route(paramNames: names, middleware: middleware, handler: handler)
+                node.routes[method] = Route(paramNames: names, middleware: middleware, handler: handler, upload: upload)
             }
         }
 
@@ -396,11 +443,13 @@ final class CompiledRouter: Sendable {
     let errorHandler: ErrorHandler
     /// Largest frame any WebSocket route accepts; 0 when there are no WebSocket routes.
     let maxWebSocketFrameSize: Int
+    let hasUploadRoutes: Bool
 
     init(_ builder: Builder, notFound: @escaping Handler, errorHandler: @escaping ErrorHandler) {
         self.notFound = notFound
         self.errorHandler = errorHandler
         self.maxWebSocketFrameSize = builder.maxWebSocketFrameSize
+        self.hasUploadRoutes = builder.hasUploadRoutes
         self.root = builder.root
         self.scopedMiddleware = builder.middleware
         self.hasScopedMiddleware = builder.middleware.contains { !$0.prefix.isEmpty }
@@ -414,6 +463,13 @@ final class CompiledRouter: Sendable {
             if method == "HEAD" { return node.routes["GET"] }
             return nil
         }.map { ($0.0, Self.params($0.0.paramNames, $0.1)) }
+    }
+
+    /// Upload options if `uri` targets an `upload(...)` route (checked when the headers arrive).
+    func uploadOptions(method: HTTPMethod, uri: String) -> UploadOptions? {
+        let path = uri.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""
+        let segments = path.split(separator: "/", omittingEmptySubsequences: true)
+        return match(method: method.rawValue, segments: Array(segments))?.0.upload
     }
 
     /// Finds the WebSocket route for a path.

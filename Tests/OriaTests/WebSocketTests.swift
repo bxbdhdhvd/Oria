@@ -159,6 +159,44 @@ import Testing
         await server.shutdown()
     }
 
+    @Test func sameOriginIsTheDefault() async throws {
+        let (server, port) = try await startServer(makeApp())
+        let (evil, evilHead) = try await RawClient.webSocket(port: port, path: "/echo", headers: ["Origin": "https://evil.example"])
+        #expect(evilHead.hasPrefix("HTTP/1.1 403"), "cross-site pages can't open sockets without an allow-list")
+        evil.close()
+        let (same, sameHead) = try await RawClient.webSocket(port: port, path: "/echo", headers: ["Origin": "http://localhost"])
+        expectUpgraded(sameHead)
+        same.close()
+        let (native, nativeHead) = try await RawClient.webSocket(port: port, path: "/echo")
+        expectUpgraded(nativeHead)  // non-browser clients send no Origin
+        native.close()
+        #expect(PipelineFactory.isSameOrigin("https://App.example.com:443", host: "app.example.com"))
+        #expect(PipelineFactory.isSameOrigin("http://a.test:8080", host: "a.test:8080"))
+        #expect(!PipelineFactory.isSameOrigin("http://a.test:8080", host: "a.test"))
+        #expect(!PipelineFactory.isSameOrigin("null", host: "a.test"))
+        await server.shutdown()
+    }
+
+    @Test func badHandshakesGetAnAnswer() async throws {
+        let (server, port) = try await startServer(makeApp())
+        let base = "GET /echo HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        let cases: [(String, String)] = [
+            ("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 99\r\n\r\n", "HTTP/1.1 426"),
+            ("Sec-WebSocket-Version: 13\r\n\r\n", "HTTP/1.1 400"),
+            ("Sec-WebSocket-Key: short\r\nSec-WebSocket-Version: 13\r\n\r\n", "HTTP/1.1 400"),
+            ("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nContent-Length: 5\r\n\r\nhello", "HTTP/1.1 400"),
+        ]
+        for (rest, expected) in cases {
+            let client = try await RawClient.connect(port: port)
+            try await client.send(base + rest)
+            let head = await client.responseHead()
+            #expect(head?.hasPrefix(expected) == true, "\(rest.prefix(40)) -> \(head ?? "no response")")
+            if expected == "HTTP/1.1 426" { #expect(head?.lowercased().contains("sec-websocket-version: 13") == true) }
+            client.close()
+        }
+        await server.shutdown()
+    }
+
     @Test func negotiatesSubprotocol() async throws {
         let (server, port) = try await startServer(makeApp())
         let (ws, head) = try await RawClient.webSocket(

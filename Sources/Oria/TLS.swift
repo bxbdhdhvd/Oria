@@ -35,6 +35,12 @@ public struct TLSOptions: Sendable {
             privateKey: .privateKey(key)
         )
         configuration.minimumTLSVersion = .tlsv12
+        // TLS 1.2: forward-secret AEAD suites only (TLS 1.3 suites are always AEAD).
+        configuration.cipherSuites = [
+            "ECDHE-ECDSA-AES128-GCM-SHA256", "ECDHE-RSA-AES128-GCM-SHA256",
+            "ECDHE-ECDSA-AES256-GCM-SHA384", "ECDHE-RSA-AES256-GCM-SHA384",
+            "ECDHE-ECDSA-CHACHA20-POLY1305", "ECDHE-RSA-CHACHA20-POLY1305",
+        ].joined(separator: ":")
         return TLSOptions(configuration: configuration)
     }
 }

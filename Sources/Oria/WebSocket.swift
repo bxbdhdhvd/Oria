@@ -16,8 +16,10 @@ public struct WebSocketOptions: Sendable {
     public var maxMessageSize: Int = 1 << 20
     /// Allowed `Origin` header values. `nil` allows any origin.
     ///
-    /// Browsers don't apply CORS to WebSockets, so set this for any socket that relies on cookies,
-    /// or a malicious page can open it with the user's credentials (cross-site WebSocket hijacking).
+    /// Origins browsers may connect from, e.g. `["https://app.example.com"]`; `["*"]` allows any.
+    /// Browsers don't apply CORS to WebSockets, so a malicious page could otherwise open the socket
+    /// with the user's cookies (cross-site WebSocket hijacking). `nil` (the default) allows only
+    /// same-origin browser connections (`Origin` matching `Host`) plus clients that send no `Origin`.
     public var allowedOrigins: [String]?
     /// Supported subprotocols in preference order (`Sec-WebSocket-Protocol`). Empty means none.
     public var protocols: [String] = []
@@ -348,12 +350,16 @@ public final class WebSocket: Sendable {
 
     private func pingLoop(every interval: TimeAmount) async {
         let nanos = max(1, interval.nanoseconds)
+        var pingSentAt: Int64? = nil
         while !Task.isCancelled && !isClosed {
             do { try await Task.sleep(nanoseconds: UInt64(nanos)) } catch { return }
-            if Self.now() - lastActivity.load(ordering: .relaxed) > 2 * nanos {
-                channel.close(promise: nil)  // Dead peer: no frames (not even pongs) for two intervals.
+            // Dead peer: nothing at all (not even a pong) since our last ping. Only judged after a
+            // ping went out, so a late timer under load never drops a peer it hasn't asked yet.
+            if let sent = pingSentAt, lastActivity.load(ordering: .relaxed) < sent {
+                channel.close(promise: nil)
                 return
             }
+            pingSentAt = Self.now()
             await sendControl(.ping, data: allocator.buffer(capacity: 0))
         }
     }

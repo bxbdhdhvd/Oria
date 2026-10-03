@@ -55,6 +55,11 @@ public final class Oria: Router, @unchecked Sendable {
         public var maxHeaderSize = 16 * 1024
         /// Maximum number of request headers.
         public var maxHeaderCount = 200
+        /// Run request handlers on the event loop that owns the connection (a Swift `TaskExecutor`
+        /// backed by NIO). A request that doesn't hop to another actor then never changes threads,
+        /// which is what gives Oria its latency. Turn it off only if handlers do long CPU-bound work
+        /// without awaiting: that would stall other connections on the same loop.
+        public var runHandlersOnEventLoops = true
 
         public init() {}
     }

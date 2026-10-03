@@ -1,3 +1,5 @@
+import NIOPosix
+
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Musl)
@@ -11,8 +13,30 @@ enum HTTPDate {
     private static let days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
     private static let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
+    /// The current date header, formatted at most once per second per thread.
     static func now() -> String {
-        format(time(nil))
+        let seconds = time(nil)
+        let cache = DateCache.current
+        if cache.seconds != seconds {
+            cache.seconds = seconds
+            cache.value = format(seconds)
+        }
+        return cache.value
+    }
+
+    private final class DateCache {
+        var seconds: time_t = -1
+        var value = ""
+
+        /// One cache per thread: no locks, no sharing.
+        static var current: DateCache {
+            if let existing = storage.currentValue { return existing }
+            let cache = DateCache()
+            storage.currentValue = cache
+            return cache
+        }
+
+        nonisolated(unsafe) static let storage = ThreadSpecificVariable<DateCache>()
     }
 
     static func format(_ seconds: time_t) -> String {
@@ -21,6 +45,24 @@ enum HTTPDate {
         gmtime_r(&t, &tm)
         return "\(days[Int(tm.tm_wday)]), \(pad(tm.tm_mday)) \(months[Int(tm.tm_mon)]) \(tm.tm_year + 1900) "
             + "\(pad(tm.tm_hour)):\(pad(tm.tm_min)):\(pad(tm.tm_sec)) GMT"
+    }
+
+    /// Parses an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) into seconds since 1970.
+    static func parse(_ string: String) -> Int64? {
+        let parts = string.split(separator: " ")
+        guard parts.count == 6, parts[5] == "GMT",
+            let day = Int(parts[1]), let month = months.firstIndex(of: String(parts[2])), let year = Int(parts[3])
+        else { return nil }
+        let clock = parts[4].split(separator: ":").compactMap { Int($0) }
+        guard clock.count == 3 else { return nil }
+        var tm = tm()
+        tm.tm_year = Int32(year - 1900)
+        tm.tm_mon = Int32(month)
+        tm.tm_mday = Int32(day)
+        tm.tm_hour = Int32(clock[0])
+        tm.tm_min = Int32(clock[1])
+        tm.tm_sec = Int32(clock[2])
+        return Int64(timegm(&tm))
     }
 
     private static func pad(_ v: Int32) -> String {

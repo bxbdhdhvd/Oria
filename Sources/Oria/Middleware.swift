@@ -117,8 +117,8 @@ public struct StaticOptions: Sendable {
     }
 }
 
-/// Serves files from `root` (like `express.static`). Files are streamed in 64 KiB chunks via
-/// non-blocking I/O, support ETag/If-None-Match, and path traversal is rejected.
+/// Serves files from `root` (like `express.static`). Files are streamed with non-blocking I/O,
+/// support `Range` requests, ETag/Last-Modified revalidation, and path traversal is rejected.
 public func serveStatic(_ root: String, _ options: StaticOptions = .init()) -> Middleware {
     let rootPath = FilePath(root)
     return { req, res, next in
@@ -149,28 +149,7 @@ public func serveStatic(_ root: String, _ options: StaticOptions = .init()) -> M
         }
         guard info.type == .regular else { return try await next() }
 
-        let size = Int(info.size)
-        let mtime = info.lastDataModificationTime.seconds
-        let etag = "W/\"\(String(size, radix: 16))-\(String(mtime, radix: 16))\""
-        res.set("etag", etag)
-        res.set("last-modified", HTTPDate.format(time_t(mtime)))
-        res.set("cache-control", "public, max-age=\(options.maxAge)")
-        res.set("accept-ranges", "none")
-        res.type(path.extension ?? "")
-
-        if req.header("if-none-match") == etag {
-            res.status(.notModified).end()
-            return
-        }
-
-        let filePath = path
-        res.stream(length: size) { writer in
-            try await FileSystem.shared.withFileHandle(forReadingAt: filePath) { handle in
-                for try await chunk in handle.readChunks(in: 0..<Int64(size), chunkLength: .kibibytes(64)) {
-                    try await writer.write(chunk)
-                }
-            }
-        }
+        try await res.sendFile(path.string, for: req, options: FileOptions(maxAge: options.maxAge))
     }
 }
 

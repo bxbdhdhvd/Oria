@@ -18,16 +18,17 @@ import NIOWebSocket
 /// - Plain connections speak HTTP/1.1 and may upgrade to WebSocket. TLS connections negotiate
 ///   HTTP/2 or HTTP/1.1 via ALPN; every HTTP/2 stream is converted to the same request type, so
 ///   routes and middleware work identically on both.
-/// - Each connection (and each HTTP/2 stream) is a structured-concurrency task over an
-///   `NIOAsyncChannel`, which gives end-to-end backpressure.
+/// - Requests (HTTP/1.1 connections and HTTP/2 streams) are read by an `HTTPRequestHandler` on the
+///   event loop; the app's handler runs in a task whose executor *is* that event loop, so a typical
+///   request never changes threads. Uploads and streamed responses get backpressure.
 /// - The routing table is compiled once and shared immutably across threads (no locks per request).
 public final class Server: Sendable {
-    typealias Connection = NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>
     typealias WebSocketChannel = NIOAsyncChannel<WebSocketFrame, WebSocketFrame>
 
     /// What a new connection turned into once TLS/ALPN and any upgrade request were processed.
     enum Negotiated: Sendable {
-        case http1(Connection, rejection: Response?)
+        /// Requests are served by an `HTTPRequestHandler`; the connection task just waits for close.
+        case http1
         case websocket(WebSocketChannel, Request, CompiledRouter.WebSocketRoute, subprotocol: String?)
         /// Streams are served by `HTTP2StreamHandler`s; the connection task just waits for close.
         case http2
@@ -82,7 +83,11 @@ public final class Server: Sendable {
         let shuttingDown = ManagedAtomic(false)
         let pipeline: PipelineFactory
         do {
-            pipeline = try PipelineFactory(app: app, router: router, intake: intake, shuttingDown: shuttingDown)
+            let env = HandlerEnvironment(
+                app: app, router: router, config: config, shuttingDown: shuttingDown,
+                executors: LoopExecutors(group: group, enabled: config.runHandlersOnEventLoops)
+            )
+            pipeline = try PipelineFactory(env: env, intake: intake)
         } catch {
             if !usesSharedGroup { try? await group.shutdownGracefully() }
             throw error
@@ -96,9 +101,6 @@ public final class Server: Sendable {
             }
             .serverChannelOption(.backlog, value: config.backlog)
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
-            .childChannelOption(.socketOption(.tcp_nodelay), value: 1)
-            .childChannelOption(.socketOption(.so_reuseaddr), value: 1)
-            .childChannelOption(.maxMessagesPerRead, value: 16)
         if config.reusePort {
             bootstrap = bootstrap.serverChannelOption(.socketOption(.so_reuseport), value: 1)
         }
@@ -115,6 +117,9 @@ public final class Server: Sendable {
             ) { channel in
                 channel.eventLoop.makeCompletedFuture {
                     do {
+                        // Child options are set here rather than with `childChannelOption`: there, one
+                        // failing setsockopt is reported on the *listening* channel and ends the accept loop.
+                        Server.configureChild(channel)
                         let probe = ConnectionProbe()
                         let state = ConnectionState(channel: channel, input: probe.input)
                         try channel.pipeline.syncOperations.addHandler(probe)
@@ -147,7 +152,10 @@ public final class Server: Sendable {
                         }
                     }
                 } catch {
-                    // The accept loop ends when the listening socket closes.
+                    // The accept loop ends when the listening socket closes; anything else is worth knowing.
+                    if !shuttingDown.load(ordering: .relaxed) {
+                        FileHandle.standardError.write(Data("[oria] accept loop failed: \(error)\n".utf8))
+                    }
                 }
             }
             // Every handler has finished. Close whatever is left: sockets dropped mid-accept, and
@@ -201,6 +209,22 @@ public final class Server: Sendable {
     /// NIO's upgrade and ALPN handlers don't always fail their result when the connection closes
     /// first (e.g. after a parse error), which would leave the handler, and therefore graceful
     /// shutdown, waiting forever. This fails the result once the channel closes.
+    private static let childOptionWarning = ManagedAtomic(false)
+
+    /// Per-connection socket options. Failures (some sandboxes refuse options to unprivileged
+    /// processes) are logged once and otherwise ignored: the connection works without them.
+    static func configureChild(_ channel: Channel) {
+        let options = channel.syncOptions
+        try? options?.setOption(.maxMessagesPerRead, value: 16)
+        do {
+            try options?.setOption(.tcpOption(.tcp_nodelay), value: 1)
+        } catch {
+            if childOptionWarning.compareExchange(expected: false, desired: true, ordering: .relaxed).exchanged {
+                FileHandle.standardError.write(Data("[oria] could not set TCP_NODELAY on accepted connections: \(error)\n".utf8))
+            }
+        }
+    }
+
     static func untilClosed<T: Sendable>(_ future: EventLoopFuture<T>, channel: Channel) -> EventLoopFuture<T> {
         let promise = channel.eventLoop.makePromise(of: T.self)
         let completed = ManagedAtomic(false)
@@ -246,14 +270,11 @@ public final class Server: Sendable {
             return
         }
 
+        _ = count
         switch negotiated {
-        case .http1(let connection, let rejection):
-            guard intake.claim(connection.channel) else { return }
-            let overCapacity = config.maxConnections.map { count > $0 } ?? false
-            await serve(
-                connection, state: state, timer: timer, http2: false, rejection: rejection, overCapacity: overCapacity,
-                drain: { await accepted.probe.drained(on: channel) }
-            )
+        case .http1:
+            timer.stop()
+            try? await channel.closeFuture.get()
 
         case .websocket(let wsChannel, let request, let route, let subprotocol):
             timer.cancel()
@@ -275,175 +296,14 @@ public final class Server: Sendable {
         }
     }
 
-    /// Serves HTTP requests on an HTTP/1.1 connection (keep-alive loop) or a single HTTP/2 stream.
-    private func serve(
-        _ connection: Connection, state: ConnectionState, timer: ReadTimer, http2: Bool,
-        rejection: Response?, overCapacity: Bool, drain: @Sendable () async -> Void
-    ) async {
-        let channel = connection.channel
-        let maxBody = config.maxBodySize
-        var rejection = rejection
-
-        do {
-            try await connection.executeThenClose { inbound, outbound in
-                // executeThenClose closes the socket right away, which would discard response bytes
-                // still queued in NIO (a slow client, a big body). Wait until they're written.
-                try await serveLoop(inbound, outbound)
-                await drain()
-            }
-        } catch {
-            // Client resets, timeouts and protocol errors simply end the connection.
-        }
-
-        func serveLoop(
-            _ inbound: NIOAsyncChannelInboundStream<HTTPServerRequestPart>,
-            _ outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
-        ) async throws {
-                // A WebSocket upgrade refused by middleware or the origin check. NIO consumed that
-                // request, so answer right away and close.
-                if let refused = rejection {
-                    rejection = nil
-                    let head = HTTPRequestHead(version: .http1_1, method: .GET, uri: "/")
-                    try await write(refused, for: head, keepAlive: false, http2: false, to: outbound)
-                    return
-                }
-                var parts = inbound.makeAsyncIterator()
-                while true {
-                    timer.arm()
-                    guard let part = try await parts.next() else { return }
-                    guard case .head(let head) = part else { continue }
-
-                    if overCapacity {
-                        try await writeSimple(.serviceUnavailable, version: head.version, http2: http2, to: outbound)
-                        return
-                    }
-                    if let length = head.headers.first(name: "content-length").flatMap(Int.init), length > maxBody {
-                        try await writeSimple(.payloadTooLarge, version: head.version, http2: http2, to: outbound)
-                        return
-                    }
-
-                    // Buffer the body, enforcing the size limit for chunked uploads too.
-                    var body: ByteBuffer?
-                    var tooLarge = false
-                    var complete = false
-                    readBody: while let next = try await parts.next() {
-                        switch next {
-                        case .body(var chunk):
-                            if body == nil {
-                                body = chunk
-                            } else {
-                                body!.writeBuffer(&chunk)
-                            }
-                            if body!.readableBytes > maxBody {
-                                tooLarge = true
-                                break readBody
-                            }
-                        case .end:
-                            complete = true
-                            break readBody
-                        case .head:
-                            return
-                        }
-                    }
-                    timer.cancel()
-                    // The stream ending before `.end` means the connection closed mid-request (read
-                    // timeout, client gone). Never run a handler on a truncated body.
-                    guard complete || tooLarge else { return }
-                    if tooLarge {
-                        try await writeSimple(.payloadTooLarge, version: head.version, http2: http2, to: outbound)
-                        return
-                    }
-
-                    let req = Request(
-                        head: head, body: body, remoteAddress: channel.remoteAddress ?? channel.parent?.remoteAddress,
-                        trustProxy: config.trustProxy
-                    )
-                    if config.tls != nil { req.isSecure = true }
-                    let res = Response(allocator: channel.allocator)
-                    await app.handle(req, res, router: router)
-
-                    var keepAlive = head.isKeepAlive && !isShuttingDown
-                    if case .stream(nil, _) = res.body, head.version.isLegacy {
-                        keepAlive = false  // HTTP/1.0 has no chunked encoding; the close delimits the body.
-                    }
-                    try await write(res, for: head, keepAlive: keepAlive, http2: http2, to: outbound)
-
-                    if http2 {
-                        // One request per stream. Let the stream finish on its own: closing it now
-                        // would reset it while flow control is still holding back response data.
-                        while try await parts.next() != nil {}
-                        return
-                    }
-                    state.requestFinished()
-                    guard keepAlive, !isShuttingDown else { return }
-                }
-        }
-    }
-
-    private func write(
-        _ res: Response, for request: HTTPRequestHead, keepAlive: Bool, http2: Bool,
-        to outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
-    ) async throws {
-        guard var headers = Server.prepareHeaders(res, for: request, keepAlive: keepAlive, http2: http2, serverName: config.serverName)
-        else {
-            try await writeSimple(.internalServerError, version: request.version, http2: http2, to: outbound)
-            return
-        }
-        let code = res.statusCode.code
-        let statusForbidsBody = code == 204 || code == 304 || (100..<200).contains(code)
-        let omitBody = request.method == .HEAD || statusForbidsBody
-
-        switch res.body {
-        case .empty:
-            if !statusForbidsBody { headers.replaceOrAdd(name: "content-length", value: "0") }
-            let head = HTTPResponseHead(version: request.version, status: res.statusCode, headers: headers)
-            try await outbound.write(contentsOf: [.head(head), .end(nil)])
-
-        case .buffer(let buffer):
-            if !statusForbidsBody {
-                headers.replaceOrAdd(name: "content-length", value: String(buffer.readableBytes))
-            }
-            let head = HTTPResponseHead(version: request.version, status: res.statusCode, headers: headers)
-            if omitBody {
-                try await outbound.write(contentsOf: [.head(head), .end(nil)])
-            } else {
-                try await outbound.write(contentsOf: [.head(head), .body(.byteBuffer(buffer)), .end(nil)])
-            }
-
-        case .stream(let length, let producer):
-            if let length { headers.replaceOrAdd(name: "content-length", value: String(length)) }
-            let head = HTTPResponseHead(version: request.version, status: res.statusCode, headers: headers)
-            try await outbound.write(.head(head))
-            if !omitBody {
-                try await producer(
-                    BodyWriter(allocator: res.allocator) { chunk in
-                        try await outbound.write(.body(.byteBuffer(chunk)))
-                    })
-            }
-            try await outbound.write(.end(nil))
-        }
-    }
-
-    private func writeSimple(
-        _ status: HTTPResponseStatus, version: HTTPVersion, http2: Bool,
-        to outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
-    ) async throws {
-        let body = ByteBuffer(string: "{\"error\":\"\(status.reasonPhrase)\"}")
-        var headers = HTTPHeaders()
-        headers.add(name: "content-type", value: "application/json; charset=utf-8")
-        headers.add(name: "content-length", value: String(body.readableBytes))
-        if !http2 { headers.add(name: "connection", value: "close") }
-        headers.add(name: "date", value: HTTPDate.now())
-        let head = HTTPResponseHead(version: version, status: status, headers: headers)
-        try await outbound.write(contentsOf: [.head(head), .body(.byteBuffer(body)), .end(nil)])
-    }
-
     /// Response headers plus date/server/connection. Nil if a header contains CR/LF/NUL (response
     /// splitting): the caller then fails closed with a 500.
     static func prepareHeaders(
         _ res: Response, for request: HTTPRequestHead, keepAlive: Bool, http2: Bool, serverName: String?
     ) -> HTTPHeaders? {
+        // Take the headers out of the response so the mutations below don't copy them (CoW).
         var headers = res.headers
+        res.headers = HTTPHeaders()
         guard headersAreSafe(headers) else {
             FileHandle.standardError.write(Data("[oria] refused to send unsafe response header (CR/LF/NUL)\n".utf8))
             return nil
@@ -479,20 +339,21 @@ public final class Server: Sendable {
 /// Builds each new connection's channel pipeline: optional TLS + ALPN, HTTP/1.1 with WebSocket
 /// upgrades, or HTTP/2.
 struct PipelineFactory: Sendable {
-    let app: Oria
-    let router: CompiledRouter
+    let env: HandlerEnvironment
     let intake: ConnectionIntake
-    let config: Oria.Configuration
     let sslContext: NIOSSLContext?
     let decoderLimits: NIOHTTPDecoderLimitConfiguration
-    let shuttingDown: ManagedAtomic<Bool>
+    /// Open connections, counted when the pipeline is built (for `maxConnections`).
+    let liveConnections = ManagedAtomic(0)
 
-    init(app: Oria, router: CompiledRouter, intake: ConnectionIntake, shuttingDown: ManagedAtomic<Bool>) throws {
-        self.shuttingDown = shuttingDown
-        self.app = app
-        self.router = router
+    var app: Oria { env.app }
+    var router: CompiledRouter { env.router }
+    var config: Oria.Configuration { env.config }
+
+    init(env: HandlerEnvironment, intake: ConnectionIntake) throws {
+        self.env = env
         self.intake = intake
-        self.config = app.configuration
+        let config = env.config
         if var tls = config.tls?.configuration {
             tls.applicationProtocols = config.http2 ? ["h2", "http/1.1"] : ["http/1.1"]
             self.sslContext = try NIOSSLContext(configuration: tls)
@@ -508,15 +369,19 @@ struct PipelineFactory: Sendable {
 
     /// Runs synchronously on the child channel's event loop.
     func configure(_ channel: Channel, state: ConnectionState) throws -> EventLoopFuture<Server.Negotiated> {
+        let open = liveConnections.wrappingIncrementThenLoad(ordering: .relaxed)
+        let counter = liveConnections
+        channel.closeFuture.whenComplete { _ in counter.wrappingDecrement(ordering: .relaxed) }
+        let overCapacity = config.maxConnections.map { open > $0 } ?? false
         let sync = channel.pipeline.syncOperations
         if let idle = config.idleTimeout {
             try sync.addHandler(IdleStateHandler(allTimeout: idle))
             try sync.addHandler(IdleCloseHandler())
         }
-        guard let sslContext else { return try configureHTTP1(channel) }
+        guard let sslContext else { return try configureHTTP1(channel, state: state, overCapacity: overCapacity) }
 
         try sync.addHandler(NIOSSLServerHandler(context: sslContext))
-        guard config.http2 else { return try configureHTTP1(channel) }
+        guard config.http2 else { return try configureHTTP1(channel, state: state, overCapacity: overCapacity) }
 
         // ALPN picks the protocol: "h2" gets HTTP/2, anything else (or no ALPN) HTTP/1.1.
         // The ALPN handler buffers inbound bytes until its future completes, so it must complete as
@@ -529,7 +394,7 @@ struct PipelineFactory: Sendable {
                     try factory.configureHTTP2(channel, state: state)
                     return channel.eventLoop.makeSucceededFuture(.http2)
                 }
-                return try factory.configureHTTP1(channel)
+                return try factory.configureHTTP1(channel, state: state, overCapacity: overCapacity)
             }
         }
         try sync.addHandler(alpn)
@@ -549,7 +414,7 @@ struct PipelineFactory: Sendable {
         case reject(Response)
     }
 
-    func configureHTTP1(_ channel: Channel) throws -> EventLoopFuture<Server.Negotiated> {
+    func configureHTTP1(_ channel: Channel, state: ConnectionState, overCapacity: Bool) throws -> EventLoopFuture<Server.Negotiated> {
         let decision = NIOLockedValueBox<UpgradeDecision?>(nil)
         let factory = self
         var upgraders: [any NIOTypedHTTPServerProtocolUpgrader<Server.Negotiated>] = []
@@ -591,21 +456,54 @@ struct PipelineFactory: Sendable {
                         if factory.config.compression {
                             try channel.pipeline.syncOperations.addHandler(factory.compressor())
                         }
-                        let connection = try factory.intake.admit { try Server.Connection(wrappingChannelSynchronously: channel) }
                         var rejection: Response?
                         if case .reject(let res) = decision.withLockedValue({ $0 }) { rejection = res }
-                        return .http1(connection, rejection: rejection)
+                        // Keep the per-request path short: these only matter before the first request.
+                        let sync = channel.pipeline.syncOperations
+                        if let closer = try? sync.handler(type: ParseErrorCloser.self) { sync.removeHandler(closer, promise: nil) }
+                        if let probe = try? sync.handler(type: ConnectionProbe.self) { sync.removeHandler(probe, promise: nil) }
+                        // HTTPRequestHandler enforces read deadlines and write stalls itself.
+                        if let idle = try? sync.handler(type: IdleStateHandler.self) { sync.removeHandler(idle, promise: nil) }
+                        if let idleCloser = try? sync.handler(type: IdleCloseHandler.self) { sync.removeHandler(idleCloser, promise: nil) }
+                        try channel.pipeline.syncOperations.addHandler(
+                            HTTPRequestHandler(
+                                env: factory.env, mode: .http1(rejection: rejection, overCapacity: overCapacity),
+                                state: state, channel: channel
+                            )
+                        )
+                        return .http1
                     }
                 }
             )
         )
         configuration.decoderConfiguration = decoderLimits
+        // Oria validates response headers itself (and answers 500 instead of failing the write), and
+        // `HTTPRequestHandler` answers parse errors with 400: two fewer handlers per request.
+        configuration.enableResponseHeaderValidation = false
+        configuration.enableErrorHandling = false
         let sync = channel.pipeline.syncOperations
         let result = try sync.configureUpgradableHTTPServerPipeline(configuration: configuration)
         let upgradeHandler = try sync.handler(type: NIOTypedHTTPServerUpgradeHandler<Server.Negotiated>.self)
         try sync.addHandler(UpgradeFilter(router: router), position: .before(upgradeHandler))
         try sync.addHandler(ParseErrorCloser(), position: .before(upgradeHandler))
         return result
+    }
+
+    /// `Origin: https://app.example.com:8443` vs `Host: app.example.com:8443` (scheme ignored:
+    /// a TLS-terminating proxy changes it). Case-insensitive, default ports normalized.
+    static func isSameOrigin(_ origin: String, host: String?) -> Bool {
+        guard let host, let schemeEnd = origin.range(of: "://") else { return false }
+        let scheme = origin[..<schemeEnd.lowerBound].lowercased()
+        func normalize(_ authority: Substring, scheme: String) -> String {
+            var value = authority.lowercased()
+            for (s, port) in [("http", ":80"), ("ws", ":80"), ("https", ":443"), ("wss", ":443")] where s == scheme {
+                if value.hasSuffix(port) { value.removeLast(port.count) }
+            }
+            return value
+        }
+        let originHost = normalize(origin[schemeEnd.upperBound...], scheme: scheme)
+        let requestHost = normalize(Substring(host), scheme: scheme)
+        return !originHost.isEmpty && originHost == requestHost
     }
 
     private func shouldUpgrade(
@@ -620,14 +518,22 @@ struct PipelineFactory: Sendable {
         req.params = params
         if config.tls != nil { req.isSecure = true }
 
-        // Browsers send Origin on every WebSocket handshake; refuse ones not on the allow-list.
+        // Browsers send Origin on every WebSocket handshake and don't apply CORS to it. With an
+        // allow-list, only listed origins pass (`"*"` allows any). Without one, browsers may only
+        // connect same-origin, which stops cross-site WebSocket hijacking by default; non-browser
+        // clients send no Origin and are unaffected.
+        let origin = head.headers.first(name: "origin")
+        let originAllowed: Bool
         if let allowed = route.options.allowedOrigins {
-            guard let origin = head.headers.first(name: "origin"), allowed.contains(origin) else {
-                let res = Response(allocator: channel.allocator)
-                res.status(.forbidden).json(raw: #"{"error":"Origin not allowed"}"#)
-                decision.withLockedValue { $0 = .reject(res) }
-                return channel.eventLoop.makeSucceededFuture(nil)
-            }
+            originAllowed = allowed.contains("*") || origin.map(allowed.contains) ?? false
+        } else {
+            originAllowed = origin.map { Self.isSameOrigin($0, host: head.headers.first(name: "host")) } ?? true
+        }
+        guard originAllowed else {
+            let res = Response(allocator: channel.allocator)
+            res.status(.forbidden).json(raw: #"{"error":"Origin not allowed"}"#)
+            decision.withLockedValue { $0 = .reject(res) }
+            return channel.eventLoop.makeSucceededFuture(nil)
         }
 
         let app = self.app
@@ -655,10 +561,8 @@ struct PipelineFactory: Sendable {
             HTTP2Setting(parameter: .maxConcurrentStreams, value: config.http2MaxConcurrentStreams),
             HTTP2Setting(parameter: .maxHeaderListSize, value: config.maxHeaderSize),
         ]
-        let responder = HTTP2Responder(
-            app: app, router: router, config: config, state: state, parent: channel, shuttingDown: shuttingDown
-        )
         let factory = self
+        let parent = channel
         _ = try channel.pipeline.syncOperations.configureHTTP2Pipeline(
             mode: .server, connectionConfiguration: connection, streamConfiguration: .init()
         ) { stream in
@@ -666,170 +570,12 @@ struct PipelineFactory: Sendable {
                 let sync = stream.pipeline.syncOperations
                 try sync.addHandler(HTTP2FramePayloadToHTTP1ServerCodec())
                 if factory.config.compression { try sync.addHandler(factory.compressor()) }
-                try sync.addHandler(HTTP2StreamHandler(responder: responder))
+                try sync.addHandler(
+                    HTTPRequestHandler(env: factory.env, mode: .http2(parent: parent), state: state, channel: stream)
+                )
             }
         }
         try channel.pipeline.syncOperations.addHandler(ConnectionErrorCloser())
-    }
-}
-
-// MARK: - HTTP/2 streams
-
-/// Runs one HTTP/2 request through the app and writes the response on the stream channel.
-struct HTTP2Responder: Sendable {
-    let app: Oria
-    let router: CompiledRouter
-    let config: Oria.Configuration
-    let state: ConnectionState
-    let parent: Channel
-    let shuttingDown: ManagedAtomic<Bool>
-
-    func respond(_ head: HTTPRequestHead, body: ByteBuffer?, on stream: Channel) async {
-        let req = Request(head: head, body: body, remoteAddress: parent.remoteAddress, trustProxy: config.trustProxy)
-        if config.tls != nil { req.isSecure = true }
-        let res = Response(allocator: stream.allocator)
-        await app.handle(req, res, router: router)
-        await write(res, for: head, on: stream)
-    }
-
-    func write(_ res: Response, for request: HTTPRequestHead, on stream: Channel) async {
-        guard let headers = Server.prepareHeaders(res, for: request, keepAlive: true, http2: true, serverName: config.serverName)
-        else {
-            writeSimple(.internalServerError, version: request.version, on: stream)
-            return
-        }
-        var finalHeaders = headers
-        let code = res.statusCode.code
-        let statusForbidsBody = code == 204 || code == 304 || (100..<200).contains(code)
-        let omitBody = request.method == .HEAD || statusForbidsBody
-        let version = request.version
-        let status = res.statusCode
-
-        switch res.body {
-        case .empty:
-            if !statusForbidsBody { finalHeaders.replaceOrAdd(name: "content-length", value: "0") }
-            let head = HTTPResponseHead(version: version, status: status, headers: finalHeaders)
-            stream.eventLoop.execute {
-                stream.write(HTTPServerResponsePart.head(head), promise: nil)
-                stream.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
-            }
-        case .buffer(let buffer):
-            if !statusForbidsBody { finalHeaders.replaceOrAdd(name: "content-length", value: String(buffer.readableBytes)) }
-            let head = HTTPResponseHead(version: version, status: status, headers: finalHeaders)
-            // One hop to the event loop for the whole response.
-            stream.eventLoop.execute {
-                stream.write(HTTPServerResponsePart.head(head), promise: nil)
-                if !omitBody { stream.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil) }
-                stream.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
-            }
-        case .stream(let length, let producer):
-            if let length { finalHeaders.replaceOrAdd(name: "content-length", value: String(length)) }
-            let head = HTTPResponseHead(version: version, status: status, headers: finalHeaders)
-            do {
-                try await stream.writeAndFlush(HTTPServerResponsePart.head(head)).get()
-                if !omitBody {
-                    // Awaiting each chunk's write gives backpressure (HTTP/2 flow control included).
-                    try await producer(
-                        BodyWriter(allocator: res.allocator) { chunk in
-                            try await stream.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(chunk))).get()
-                        })
-                }
-                try await stream.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
-            } catch {
-                stream.close(promise: nil)  // Peer reset the stream or the connection closed.
-            }
-        }
-    }
-
-    func writeSimple(_ status: HTTPResponseStatus, version: HTTPVersion, on stream: Channel) {
-        let body = ByteBuffer(string: "{\"error\":\"\(status.reasonPhrase)\"}")
-        var headers = HTTPHeaders()
-        headers.add(name: "content-type", value: "application/json; charset=utf-8")
-        headers.add(name: "content-length", value: String(body.readableBytes))
-        headers.add(name: "date", value: HTTPDate.now())
-        let head = HTTPResponseHead(version: version, status: status, headers: headers)
-        stream.eventLoop.execute {
-            stream.write(HTTPServerResponsePart.head(head), promise: nil)
-            stream.write(HTTPServerResponsePart.body(.byteBuffer(body)), promise: nil)
-            stream.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
-        }
-    }
-
-    func streamClosed() {
-        // Close an idle HTTP/2 connection once draining.
-        if state.endRequest() == 0 && shuttingDown.load(ordering: .relaxed) { parent.close(promise: nil) }
-    }
-}
-
-/// Collects one HTTP/2 request on the stream's event loop (enforcing the body limit and read
-/// timeout there, so neither costs a thread hop), then hands it to a task that runs the app.
-/// Much cheaper per stream than wrapping every stream in an `NIOAsyncChannel`.
-final class HTTP2StreamHandler: ChannelInboundHandler, RemovableChannelHandler {
-    typealias InboundIn = HTTPServerRequestPart
-    typealias OutboundOut = HTTPServerResponsePart
-
-    private let responder: HTTP2Responder
-    private var head: HTTPRequestHead?
-    private var body: ByteBuffer?
-    private var rejected = false
-    private var timer: Scheduled<Void>?
-
-    init(responder: HTTP2Responder) { self.responder = responder }
-
-    func handlerAdded(context: ChannelHandlerContext) {
-        responder.state.beginRequest()
-        let responder = self.responder
-        context.channel.closeFuture.whenComplete { _ in responder.streamClosed() }
-        if let timeout = responder.config.requestReadTimeout {
-            let channel = context.channel
-            timer = context.eventLoop.scheduleTask(in: timeout) { channel.close(promise: nil) }
-        }
-    }
-
-    func handlerRemoved(context: ChannelHandlerContext) {
-        timer?.cancel()
-        timer = nil
-    }
-
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        guard !rejected else { return }
-        let maxBody = responder.config.maxBodySize
-        switch unwrapInboundIn(data) {
-        case .head(let head):
-            self.head = head
-            if let length = head.headers.first(name: "content-length").flatMap(Int.init), length > maxBody {
-                reject(context, head.version)
-            }
-        case .body(var chunk):
-            if body == nil {
-                body = chunk
-            } else {
-                body!.writeBuffer(&chunk)
-            }
-            if body!.readableBytes > maxBody, let head { reject(context, head.version) }
-        case .end:
-            timer?.cancel()
-            timer = nil
-            guard let head else { return }
-            let body = self.body
-            self.head = nil
-            self.body = nil
-            let responder = self.responder
-            let stream = context.channel
-            Task { await responder.respond(head, body: body, on: stream) }
-        }
-    }
-
-    private func reject(_ context: ChannelHandlerContext, _ version: HTTPVersion) {
-        rejected = true
-        body = nil
-        timer?.cancel()
-        timer = nil
-        responder.writeSimple(.payloadTooLarge, version: version, on: context.channel)
-    }
-
-    func errorCaught(context: ChannelHandlerContext, error: Error) {
-        context.close(promise: nil)
     }
 }
 
@@ -843,6 +589,7 @@ final class HTTP2StreamHandler: ChannelInboundHandler, RemovableChannelHandler {
 final class UpgradeFilter: ChannelInboundHandler, RemovableChannelHandler, Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias InboundOut = HTTPServerRequestPart
+    typealias OutboundOut = HTTPServerResponsePart
 
     let router: CompiledRouter
 
@@ -867,6 +614,11 @@ final class UpgradeFilter: ChannelInboundHandler, RemovableChannelHandler, Senda
         if wantsWebSocket
             && router.matchWebSocket(segments: path.split(separator: "/", omittingEmptySubsequences: true)) != nil
         {
+            // RFC 6455 §4.2.1: answer bad handshakes instead of leaving the client hanging.
+            if let rejection = Self.validateWebSocketHandshake(head) {
+                reject(context: context, status: rejection, version: head.version)
+                return
+            }
             context.fireChannelRead(data)
             return
         }
@@ -874,17 +626,67 @@ final class UpgradeFilter: ChannelInboundHandler, RemovableChannelHandler, Senda
         head.headers.replaceOrAdd(name: "connection", value: "close")
         context.fireChannelRead(wrapInboundOut(.head(head)))
     }
+
+    static func validateWebSocketHandshake(_ head: HTTPRequestHead) -> HTTPResponseStatus? {
+        guard head.method == .GET, head.version == .http1_1 else { return .badRequest }
+        // An upgrade request carries no body; bytes after it would be parsed as WebSocket frames.
+        if head.headers.contains(name: "transfer-encoding")
+            || (head.headers.first(name: "content-length").map { $0 != "0" } ?? false)
+        {
+            return .badRequest
+        }
+        guard head.headers.first(name: "sec-websocket-version") == "13" else { return .upgradeRequired }
+        guard let key = head.headers.first(name: "sec-websocket-key"),
+            let decoded = Data(base64Encoded: key.trimmingCharacters(in: .whitespaces)), decoded.count == 16
+        else { return .badRequest }
+        return nil
+    }
+
+    private func reject(context: ChannelHandlerContext, status: HTTPResponseStatus, version: HTTPVersion) {
+        let body = ByteBuffer(string: "{\"error\":\"\(status.reasonPhrase)\"}")
+        var headers = HTTPHeaders()
+        headers.add(name: "content-type", value: "application/json")
+        headers.add(name: "content-length", value: String(body.readableBytes))
+        headers.add(name: "connection", value: "close")
+        if status == .upgradeRequired {
+            headers.add(name: "upgrade", value: "websocket")
+            headers.add(name: "sec-websocket-version", value: "13")
+        }
+        context.write(wrapOutboundOut(.head(HTTPResponseHead(version: version, status: status, headers: headers))), promise: nil)
+        context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+        context.writeAndFlush(wrapOutboundOut(.end(nil))).whenComplete { _ in context.close(promise: nil) }
+    }
 }
 
 /// NIO answers malformed requests with `400 Connection: close` but leaves the socket open while the
 /// upgrade handler waits; close it so garbage can't pin a connection until the read timeout.
-final class ParseErrorCloser: ChannelInboundHandler, Sendable {
+final class ParseErrorCloser: ChannelInboundHandler, RemovableChannelHandler, Sendable {
     typealias InboundIn = HTTPServerRequestPart
+    typealias OutboundOut = HTTPServerResponsePart
 
+    /// Malformed first request (before `HTTPRequestHandler` is installed): answer 400 (431 for
+    /// oversized headers, 414 for oversized URLs) and close. A peer hanging up mid-request gets no answer.
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        if error is HTTPParserError {
-            context.flush()
-            context.close(promise: nil)
+        if let parseError = error as? HTTPParserError {
+            if parseError != .invalidEOFState {
+                let status: HTTPResponseStatus
+                switch parseError {
+                case .headerOverflow: status = .requestHeaderFieldsTooLarge
+                case .invalidURL: status = .uriTooLong
+                default: status = .badRequest
+                }
+                let body = ByteBuffer(string: "{\"error\":\"\(status.reasonPhrase)\"}")
+                var headers = HTTPHeaders()
+                headers.add(name: "content-type", value: "application/json")
+                headers.add(name: "content-length", value: String(body.readableBytes))
+                headers.add(name: "connection", value: "close")
+                context.write(wrapOutboundOut(.head(HTTPResponseHead(version: .http1_1, status: status, headers: headers))), promise: nil)
+                context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+                context.writeAndFlush(wrapOutboundOut(.end(nil))).whenComplete { _ in context.close(promise: nil) }
+            } else {
+                context.close(promise: nil)
+            }
+            return
         }
         context.fireErrorCaught(error)
     }
@@ -993,6 +795,23 @@ final class AcceptTracker: ChannelInboundHandler, Sendable {
         }
         context.fireChannelRead(data)
     }
+
+    /// Accept errors (EMFILE/ENFILE when out of descriptors, ENOBUFS, ECONNABORTED…) are transient:
+    /// NIO keeps the listening socket open and retries. They must not reach the async server
+    /// channel, where any error ends the accept loop and with it the server.
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        let now = NIODeadline.now()
+        if now - lastLog.load(ordering: .relaxed).asDeadline > .seconds(5) {
+            lastLog.store(Int64(now.uptimeNanoseconds), ordering: .relaxed)
+            FileHandle.standardError.write(Data("[oria] accept error (server keeps running): \(error)\n".utf8))
+        }
+    }
+
+    private let lastLog = ManagedAtomic<Int64>(0)
+}
+
+extension Int64 {
+    fileprivate var asDeadline: NIODeadline { .uptimeNanoseconds(UInt64(self)) }
 }
 
 /// Per-connection state for graceful shutdown. A connection is idle when no HTTP/2 stream is open
@@ -1001,13 +820,14 @@ final class AcceptTracker: ChannelInboundHandler, Sendable {
 /// that sends a "going away" close frame.
 final class ConnectionState: Sendable {
     private struct State {
-        var active = 0
         var http2 = false
         var shutdownHook: (@Sendable () -> Void)?
     }
 
     let channel: Channel
     private let input: InputActivity
+    /// In-flight requests/streams. An atomic: it changes on every request.
+    private let active = ManagedAtomic(0)
     private let state = NIOLockedValueBox(State())
 
     init(channel: Channel, input: InputActivity) {
@@ -1017,14 +837,16 @@ final class ConnectionState: Sendable {
 
     func markHTTP2() { state.withLockedValue { $0.http2 = true } }
 
-    func beginRequest() { state.withLockedValue { $0.active += 1 } }
+    func beginRequest() { active.wrappingIncrement(ordering: .relaxed) }
 
     /// Returns the number of requests still in flight.
     func endRequest() -> Int {
-        state.withLockedValue { s in
-            s.active = max(0, s.active - 1)
-            return s.active
+        let remaining = active.wrappingDecrementThenLoad(ordering: .relaxed)
+        if remaining < 0 {
+            active.store(0, ordering: .relaxed)
+            return 0
         }
+        return remaining
     }
 
     /// An HTTP/1 response went out; the connection is idle until the next request's bytes arrive.
@@ -1036,12 +858,13 @@ final class ConnectionState: Sendable {
 
     func shutdown() {
         enum Action { case hook(@Sendable () -> Void), close, none }
+        let busy = active.load(ordering: .relaxed) > 0
         let action: Action = state.withLockedValue { s in
             if let hook = s.shutdownHook {
                 s.shutdownHook = nil
                 return .hook(hook)
             }
-            guard s.active == 0 else { return .none }
+            guard !busy else { return .none }
             // HTTP/2 connections always carry control frames, so only open streams count there.
             return s.http2 || !input.pending ? .close : .none
         }
@@ -1058,7 +881,7 @@ final class ConnectionState: Sendable {
 /// - lets the server wait until queued response bytes reach the socket before closing. Closing a NIO
 ///   channel discards unwritten data, and NIO completes writes in order, so an empty write's
 ///   promise fires only after everything queued before it.
-final class ConnectionProbe: ChannelInboundHandler, @unchecked Sendable {
+final class ConnectionProbe: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = NIOAny
     typealias OutboundOut = ByteBuffer
 
@@ -1160,7 +983,7 @@ final class ReadTimer: Sendable {
 }
 
 /// Closes a connection when `IdleStateHandler` reports inactivity.
-final class IdleCloseHandler: ChannelInboundHandler, Sendable {
+final class IdleCloseHandler: ChannelInboundHandler, RemovableChannelHandler, Sendable {
     typealias InboundIn = NIOAny
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {

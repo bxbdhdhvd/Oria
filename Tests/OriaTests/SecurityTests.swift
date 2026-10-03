@@ -231,11 +231,11 @@ import Testing
     }
 
     @Test func idleKeepAliveConnectionsAreReclaimed() async throws {
-        let (server, port) = try await startServer(makeApp { $0.requestReadTimeout = .milliseconds(300) })
+        let (server, port) = try await startServer(makeApp { $0.requestReadTimeout = .seconds(1) })
         let client = try await RawClient.connect(port: port)
         try await client.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
         #expect(try #require(await client.responseHead()).hasPrefix("HTTP/1.1 200"))
-        #expect(await client.waitForClose(timeout: .seconds(2)))
+        #expect(await client.waitForClose(timeout: .seconds(4)))
         await server.shutdown()
     }
 

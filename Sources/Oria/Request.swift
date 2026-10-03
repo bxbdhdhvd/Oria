@@ -28,6 +28,30 @@ public final class Request: @unchecked Sendable {
     public var locals: [String: any Sendable] = [:]
 
     let trustProxy: Bool
+
+    /// The parsed form on `app.upload(...)` routes when the body was `multipart/form-data`.
+    /// Files are already on disk; see `UploadedFile`.
+    public internal(set) var uploads: MultipartForm?
+    /// The body of an `app.upload(...)` route that wasn't multipart, streamed to a temporary file.
+    public internal(set) var uploadedBody: UploadedFile?
+    private var parsedMultipart: MultipartForm?
+
+    /// Parses a buffered `multipart/form-data` body in memory (normal routes, bounded by
+    /// `maxBodySize`). For large files use `app.upload(...)`, which streams to disk.
+    /// Throws `HTTPError` 415/400/413 for non-multipart, malformed or over-limit bodies.
+    public func multipart(limits: UploadOptions = .init()) throws -> MultipartForm {
+        if let uploads { return uploads }
+        if let parsedMultipart { return parsedMultipart }
+        do {
+            let form = try MultipartForm.parse(
+                body ?? ByteBuffer(), contentType: headers.first(name: "content-type") ?? "", limits: limits
+            )
+            parsedMultipart = form
+            return form
+        } catch let error as MultipartError {
+            throw error.httpError
+        }
+    }
     /// Whether the request arrived over TLS (or via a trusted proxy reporting `X-Forwarded-Proto: https`).
     public internal(set) var isSecure = false
 
