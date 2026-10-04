@@ -888,6 +888,19 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         if !queue.isEmpty || pendingRead { drainQueue() }
     }
 
+    /// Timeouts and stalled readers: reset the connection (SO_LINGER 0) instead of a graceful close.
+    /// A graceful close would leave the kernel holding the unsent bytes for a peer that never reads
+    /// (FIN_WAIT1 with a zero window) for minutes; a reset frees them at once.
+    private func abortConnection() {
+        if !isHTTP2, let provider = context?.channel as? SocketOptionProvider {
+            _ = provider.setSoLinger(linger(l_onoff: 1, l_linger: 0))
+        }
+        queue.removeAll()
+        flushPending = false
+        phase = .closing
+        context?.close(promise: nil)
+    }
+
     private func closeNow() {
         phase = .closing
         queue.removeAll()
@@ -908,7 +921,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         checker = context.eventLoop.scheduleTask(in: max(delay, .milliseconds(1))) { [self] in
             guard let context = self.context, context.channel.isActive else { return }
             if let stall = self.writeStallDeadline, NIODeadline.now() >= stall {
-                self.closeNow()
+                self.abortConnection()
                 return
             }
             let now = NIODeadline.now()
@@ -916,7 +929,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
             if let deadline = self.deadline {
                 if now >= deadline {
                     if case .uploading(let upload) = self.phase { upload.sink.finish(ChannelError.eof) }
-                    self.closeNow()
+                    self.abortConnection()
                     return
                 }
                 next = min(next, deadline - now)

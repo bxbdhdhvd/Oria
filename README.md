@@ -375,7 +375,7 @@ to cap streams per connection.
 |---|---|
 | `logger()` | `morgan('dev')` |
 | `cors(CORSOptions(...))` | `cors()`. Handles preflight requests. |
-| `serveStatic("./public", StaticOptions(...))` | `express.static()`. Non-blocking, streamed, ETag/304 support, blocks path traversal and dotfiles. |
+| `serveStatic("./public", StaticOptions(...))` | `express.static()`. Non-blocking, streamed, ETag/304 support, blocks path traversal, dotfiles and symlinks that leave the root. |
 | `rateLimit(max:window:key:)` | `express-rate-limit`. Sharded fixed window, sets `RateLimit-*` and `Retry-After`. |
 | `securityHeaders(SecurityHeadersOptions())` | `helmet()`. `nosniff`, `X-Frame-Options`, CSP, `Referrer-Policy`, COOP, and HSTS on HTTPS. |
 
@@ -489,7 +489,7 @@ The included `Dockerfile` is multi-stage. It compiles with `swift:6.2-noble` and
 
 ## Security
 
-These defenses are on by default and covered by tests that attack a real socket (115 tests in total):
+These defenses are on by default and covered by tests that attack a real socket (121 tests in total):
 
 | Attack | Behavior |
 |---|---|
@@ -497,7 +497,7 @@ These defenses are on by default and covered by tests that attack a real socket 
 | Header, URL and header-count bombs | `431`/`400` (`maxHeaderSize`, `maxHeaderCount`) |
 | Huge or endless bodies, including chunked | `413` (`maxBodySize`, per-route `UploadOptions`), refused before reading when `Content-Length` says so |
 | Slowloris (dribbled headers), slow-body uploads | closed after `requestReadTimeout` / upload `idleTimeout` |
-| Slow-read (client stops reading a large response) | closed after `idleTimeout`; memory stays flat meanwhile |
+| Slow-read (client stops reading a large response) | connection reset after `idleTimeout` (abortive close, so the kernel doesn't keep the unsent bytes around either); memory stays flat meanwhile |
 | Garbage / non-HTTP input, unknown methods, bad versions | `400` and an immediate close |
 | Response splitting (CR/LF in a header value, e.g. `res.redirect(userInput)`) | refused, `500` instead |
 | Upload path traversal (`../`, absolute, backslashes, NUL in filenames, a `/` or `.` hidden in a grapheme cluster with a combining mark or zero-width joiner, bidi overrides) | filenames sanitized at the Unicode-scalar level to a base name; temp files are random, `0600`, never visible half-written |
@@ -511,6 +511,9 @@ These defenses are on by default and covered by tests that attack a real socket 
 | Cross-site WebSocket hijacking | `403` unless same-origin or in `allowedOrigins` |
 | Malformed WebSocket handshakes, upgrade with a body | `426` / `400` |
 | Path traversal in `serveStatic`, including encoded separators glued to combining marks | `403` (byte-level checks); dotfiles hidden |
+| Symlinks in a served directory pointing outside it | not served (real path must stay under the real root; `followSymlinksOutsideRoot` to opt out) |
+| `Expect: 100-continue`, parse errors and refused upgrades with compression on | answered correctly (these bypass the compressor, which would otherwise trap on a response with no matching request) |
+| Valid pipelined requests followed by garbage | their responses arrive in order, then `400` and close |
 | Slow WebSocket consumers in a broadcast | disconnected after `outboxLimit`; never stall others |
 | File-descriptor exhaustion | accept errors are retried, the server keeps running; cap with `maxConnections` |
 
@@ -602,7 +605,7 @@ Read it from `server.port` and call `await server.shutdown()` when done.
 
 ```bash
 swift build
-swift test                                   # 110 tests: routing, HTTP/1, HTTP/2, TLS, WebSockets, uploads, ranges, attacks
+swift test                                   # 121 tests: routing, HTTP/1, HTTP/2, TLS, WebSockets, uploads, ranges, attacks
 ORIA_MEMORY_TESTS=1 swift test --filter uploadMemoryStaysFlat   # RSS check, run alone
 swift run -c release oria-example            # example app on :3000
 scripts/bench.sh 256 10s                     # HTTP/1.1 load test (needs wrk)

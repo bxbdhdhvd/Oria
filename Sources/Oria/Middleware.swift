@@ -3,6 +3,7 @@ import NIOConcurrencyHelpers
 import NIOCore
 import NIOFileSystem
 import NIOHTTP1
+import NIOPosix
 
 // MARK: - Logger
 
@@ -110,10 +111,14 @@ public struct StaticOptions: Sendable {
     public var maxAge: Int = 0
     /// Serve files whose name starts with a dot.
     public var dotfiles = false
-    public init(index: String? = "index.html", maxAge: Int = 0, dotfiles: Bool = false) {
+    /// Serve files reached through symlinks that point outside `root`. Off by default: a symlink
+    /// planted in a served directory must not expose the rest of the file system.
+    public var followSymlinksOutsideRoot = false
+    public init(index: String? = "index.html", maxAge: Int = 0, dotfiles: Bool = false, followSymlinksOutsideRoot: Bool = false) {
         self.index = index
         self.maxAge = maxAge
         self.dotfiles = dotfiles
+        self.followSymlinksOutsideRoot = followSymlinksOutsideRoot
     }
 }
 
@@ -154,7 +159,28 @@ public func serveStatic(_ root: String, _ options: StaticOptions = .init()) -> M
         }
         guard info.type == .regular else { return try await next() }
 
+        // Symlinks: the resolved file must still live under the resolved root.
+        if !options.followSymlinksOutsideRoot {
+            let target = path.string
+            let contained = try await NIOThreadPool.singleton.runIfActive { () -> Bool in
+                guard let realRoot = StaticRoot.resolve(root), let realTarget = StaticRoot.resolve(target) else {
+                    return false
+                }
+                return realTarget.hasPrefix(realRoot.hasSuffix("/") ? realRoot : realRoot + "/")
+            }
+            guard contained else { return try await next() }
+        }
+
         try await res.sendFile(path.string, for: req, options: FileOptions(maxAge: options.maxAge))
+    }
+}
+
+/// `realpath(3)`, run on a thread-pool thread (it touches the file system).
+enum StaticRoot {
+    static func resolve(_ path: String) -> String? {
+        guard let resolved = realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 }
 
