@@ -29,7 +29,7 @@ enum HTTP1Writer {
     /// contains CR, LF or NUL or an invalid name (the caller answers 500 instead).
     static func writeHead(
         into buffer: inout ByteBuffer, version: HTTPVersion, status: HTTPResponseStatus, headers: HTTPHeaders,
-        contentLength: Int?, chunked: Bool, keepAlive: Bool, serverName: String?
+        contentLength: Int?, chunked: Bool, keepAlive: Bool, serverName: String?, date: String
     ) -> Head? {
         let code = status.code
         let isCustom: Bool
@@ -64,7 +64,7 @@ enum HTTP1Writer {
         }
         if !hasDate {
             buffer.writeStaticString("date: ")
-            buffer.writeString(HTTPDate.now())
+            buffer.writeString(date)
             buffer.writeStaticString("\r\n")
         }
         if let serverName, isValidValue(serverName) {

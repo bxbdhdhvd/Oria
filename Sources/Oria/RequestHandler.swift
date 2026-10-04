@@ -23,19 +23,36 @@ final class EventLoopExecutor: TaskExecutor, @unchecked Sendable {
     }
 }
 
-/// One executor per event loop, built once at startup (lock-free lookups afterwards).
+/// The `Date` header for one event loop, formatted at most once per second. Only touched from its
+/// own loop, so it needs no lock and no thread-local lookup.
+final class LoopDateCache: @unchecked Sendable {
+    @exclusivity(unchecked) private var seconds: time_t = -1
+    @exclusivity(unchecked) private var value = ""
+
+    func now() -> String {
+        let current = time(nil)
+        if current != seconds {
+            seconds = current
+            value = HTTPDate.format(current)
+        }
+        return value
+    }
+}
+
+/// Per-event-loop helpers, built once at startup (lock-free lookups afterwards).
 struct LoopExecutors: Sendable {
-    private let map: [ObjectIdentifier: EventLoopExecutor]
+    private let map: [ObjectIdentifier: (EventLoopExecutor?, LoopDateCache)]
 
     init(group: any EventLoopGroup, enabled: Bool) {
-        var map: [ObjectIdentifier: EventLoopExecutor] = [:]
-        if enabled {
-            for loop in group.makeIterator() { map[ObjectIdentifier(loop)] = EventLoopExecutor(loop) }
+        var map: [ObjectIdentifier: (EventLoopExecutor?, LoopDateCache)] = [:]
+        for loop in group.makeIterator() {
+            map[ObjectIdentifier(loop)] = (enabled ? EventLoopExecutor(loop) : nil, LoopDateCache())
         }
         self.map = map
     }
 
-    func executor(for loop: EventLoop) -> EventLoopExecutor? { map[ObjectIdentifier(loop)] }
+    func executor(for loop: EventLoop) -> EventLoopExecutor? { map[ObjectIdentifier(loop)]?.0 }
+    func dateCache(for loop: EventLoop) -> LoopDateCache { map[ObjectIdentifier(loop)]?.1 ?? LoopDateCache() }
 }
 
 /// Everything a request handler needs, shared by all connections of a server. A class, so passing
@@ -119,6 +136,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
     private let mode: Mode
     private let state: ConnectionState
     private let executor: EventLoopExecutor?
+    private let dates: LoopDateCache
     private let eventLoop: EventLoop
     private let channel: Channel
     // Event-loop-confined state. Dynamic exclusivity checks are disabled for these hot fields:
@@ -169,6 +187,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         self.mode = mode
         self.state = state
         self.executor = executor
+        self.dates = env.executors.dateCache(for: channel.eventLoop)
         self.checkInterval = env.requestReadTimeout ?? .seconds(30)
         if case .http1 = mode { self.rawOutput = !env.config.compression } else { self.rawOutput = false }
     }
@@ -461,7 +480,10 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         }
         #if compiler(>=6.2)
         if #available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, *), eventLoop.inEventLoop {
-            Task.immediate(executorPreference: executor, operation: operation)
+            // Starts right here on the event loop. No executor preference: maintaining one costs
+            // a locked status-record lookup on every task switch. A handler that suspends resumes
+            // on the shared pool, and its response hops back to this loop once (`onLoop`).
+            Task.immediate(operation: operation)
             return
         }
         #endif
@@ -623,7 +645,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
             let head = HTTP1Writer.writeHead(
                 into: &buffer, version: request.version, status: res.statusCode, headers: res.headers,
                 contentLength: forbidsBody ? nil : bodyBytes, chunked: false, keepAlive: keepAlive,
-                serverName: env.serverName)
+                serverName: env.serverName, date: dates.now())
         else {
             refuseUnsafeHeaders(version: request.version)
             return
@@ -694,7 +716,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
             let head = HTTP1Writer.writeHead(
                 into: &buffer, version: request.version, status: res.statusCode, headers: res.headers,
                 contentLength: forbidsBody ? nil : length, chunked: chunked, keepAlive: keepAlive,
-                serverName: env.serverName)
+                serverName: env.serverName, date: HTTPDate.now())  // may run off the loop: thread-local cache
         else {
             onLoop { self.refuseUnsafeHeaders(version: request.version) }
             return
@@ -761,7 +783,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
             var buffer = context.channel.allocator.buffer(capacity: 256)
             _ = HTTP1Writer.writeHead(
                 into: &buffer, version: version, status: status, headers: headers, contentLength: body.readableBytes,
-                chunked: false, keepAlive: !close, serverName: env.serverName)
+                chunked: false, keepAlive: !close, serverName: env.serverName, date: dates.now())
             buffer.writeImmutableBuffer(body)
             finish(last: buffer, keepAlive: !close, context: context)
             return

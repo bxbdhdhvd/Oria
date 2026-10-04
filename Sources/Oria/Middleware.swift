@@ -127,10 +127,15 @@ public func serveStatic(_ root: String, _ options: StaticOptions = .init()) -> M
         var segments: [String] = []
         for raw in req.subpath.split(separator: "/", omittingEmptySubsequences: true) {
             let seg = raw.removingPercentEncoding ?? String(raw)
-            if seg == ".." || seg.contains("/") || seg.contains("\\") || seg.contains("\0") {
+            // Byte-level checks: Character comparisons would miss a "/" followed by a combining
+            // mark or zero-width joiner (one grapheme cluster), which FilePath still splits on.
+            let bytes = seg.utf8
+            if seg.utf8.elementsEqual("..".utf8) || bytes.contains(UInt8(ascii: "/"))
+                || bytes.contains(UInt8(ascii: "\\")) || bytes.contains(0)
+            {
                 throw HTTPError(.forbidden)
             }
-            if seg.hasPrefix(".") && !options.dotfiles { return try await next() }
+            if bytes.first == UInt8(ascii: ".") && !options.dotfiles { return try await next() }
             segments.append(seg)
         }
 

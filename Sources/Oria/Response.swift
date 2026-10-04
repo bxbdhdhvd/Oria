@@ -81,12 +81,12 @@ public final class Response: @unchecked Sendable {
 
     /// Sends a text body. Defaults to `text/html` like Express.
     public func send(_ string: String) {
-        if headers["content-type"].isEmpty { set("content-type", "text/html; charset=utf-8") }
+        if !headers.contains(name: "content-type") { set("content-type", "text/html; charset=utf-8") }
         finish(.buffer(allocator.buffer(string: string)))
     }
 
     public func send(_ buffer: ByteBuffer) {
-        if headers["content-type"].isEmpty { set("content-type", "application/octet-stream") }
+        if !headers.contains(name: "content-type") { set("content-type", "application/octet-stream") }
         finish(.buffer(buffer))
     }
 
@@ -99,10 +99,24 @@ public final class Response: @unchecked Sendable {
     }
 
     /// Encodes any `Encodable` value as JSON.
-    public func json<T: Encodable>(_ value: T, encoder: JSONEncoder = Response.defaultEncoder) throws {
-        let data = try encoder.encode(value)
-        if headers["content-type"].isEmpty { set("content-type", "application/json; charset=utf-8") }
-        finish(.buffer(allocator.buffer(bytes: data)))
+    /// Sends `value` as JSON. With the default encoder this uses Oria's streaming encoder
+    /// (`FastJSON`: same output as `JSONEncoder()`, written straight into the response buffer);
+    /// pass a configured `JSONEncoder` for other strategies (dates, key casing, pretty printing).
+    public func json<T: Encodable>(_ value: T, encoder: JSONEncoder? = nil) throws {
+        let body: ByteBuffer
+        if let encoder {
+            body = allocator.buffer(bytes: try encoder.encode(value))
+        } else {
+            var buffer = allocator.buffer(capacity: 128)
+            do {
+                try FastJSON.encode(value, into: &buffer)
+                body = buffer
+            } catch {
+                body = allocator.buffer(bytes: try Response.defaultEncoder.encode(value))
+            }
+        }
+        if !headers.contains(name: "content-type") { set("content-type", "application/json; charset=utf-8") }
+        finish(.buffer(body))
     }
 
     /// Sends a pre-serialized JSON string.
