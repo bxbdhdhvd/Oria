@@ -52,6 +52,47 @@ import Testing
         #expect(client.text.hasPrefix("HTTP/1.1 200"), "server must keep serving after an attack")
     }
 
+    // MARK: Regressions from the HTTP/1.1 fast-path pen test
+
+    /// `Expect: 100-continue` with response compression once crashed the process (NIO's compressor
+    /// paired the interim 1xx head with the request).
+    @Test(arguments: [false, true]) func expectContinueNeverCrashes(compression: Bool) async throws {
+        let (server, port) = try await startServer(makeApp { $0.compression = compression })
+        for raw in [
+            "GET / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+            "POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        ] {
+            let client = try await exchange(port, raw)
+            #expect(client.text.hasPrefix("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200"), "\(client.text.prefix(80))")
+        }
+        try await assertStillServing(port)
+        await server.shutdown()
+    }
+
+    /// Valid pipelined requests followed by garbage in the same write: the valid responses arrive
+    /// in order, then a 400, then the connection closes.
+    @Test(arguments: [false, true]) func pipelinedRequestsBeforeAParseErrorAreAnswered(compression: Bool) async throws {
+        let (server, port) = try await startServer(makeApp { $0.compression = compression })
+        let client = try await exchange(
+            port, "GET /seq/1 HTTP/1.1\r\nHost: x\r\n\r\nGET /seq/2 HTTP/1.1\r\nHost: x\r\n\r\n\u{1}GARBAGE\r\n\r\n")
+        let statuses = client.text.components(separatedBy: "HTTP/1.1 ").dropFirst().map { $0.prefix(3) }
+        #expect(statuses == ["200", "200", "400"], "\(client.text)")
+        #expect(client.text.contains("\r\n\r\n1") && client.text.contains("\r\n\r\n2"))
+        await server.shutdown()
+    }
+
+    /// A malformed request later on a keep-alive connection gets a 400 like a first request does.
+    @Test(arguments: [false, true]) func laterMalformedRequestsGet400(compression: Bool) async throws {
+        let (server, port) = try await startServer(makeApp { $0.compression = compression })
+        let client = try await RawClient.connect(port: port)
+        try await client.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        #expect(await client.wait { text, _ in text.contains("ok") })
+        try await client.send("\u{1}GARBAGE\r\n\r\n")
+        #expect(await client.wait { text, closed in closed && text.contains("HTTP/1.1 400") }, "\(client.text)")
+        client.close()
+        await server.shutdown()
+    }
+
     // MARK: Request smuggling & parser abuse
 
     @Test func rejectsContentLengthPlusTransferEncoding() async throws {

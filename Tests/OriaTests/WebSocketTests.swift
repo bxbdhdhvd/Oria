@@ -177,6 +177,19 @@ import Testing
         await server.shutdown()
     }
 
+    /// A refused upgrade with response compression on once tripped NIO's compressor (no request
+    /// head had passed through it).
+    @Test func refusedUpgradeWithCompressionKeepsServing() async throws {
+        let (server, port) = try await startServer(makeApp { $0.compression = true })
+        let (evil, head) = try await RawClient.webSocket(port: port, path: "/echo", headers: ["Origin": "https://evil.example"])
+        #expect(head.hasPrefix("HTTP/1.1 403"))
+        evil.close()
+        let (ok, okHead) = try await RawClient.webSocket(port: port, path: "/echo")
+        expectUpgraded(okHead)
+        ok.close()
+        await server.shutdown()
+    }
+
     @Test func badHandshakesGetAnAnswer() async throws {
         let (server, port) = try await startServer(makeApp())
         let base = "GET /echo HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
