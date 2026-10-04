@@ -231,6 +231,19 @@ import Testing
         await server.shutdown()
     }
 
+    @Test func reservedBitsAreRejected() async throws {
+        let (server, port) = try await startServer(makeApp())
+        for rsv: UInt8 in [0x40, 0x20, 0x10] {
+            let (ws, _) = try await RawClient.webSocket(port: port, path: "/echo")
+            var frame = RawClient.frame(opcode: 0x1, payload: Array("hi".utf8))
+            frame[0] |= rsv  // no extension negotiated: RFC 6455 says fail the connection
+            try await ws.send(frame)
+            #expect(await ws.readFrame()?.closeCode == 1002, "rsv bit \(rsv)")
+            ws.close()
+        }
+        await server.shutdown()
+    }
+
     @Test func invalidUTF8IsRejected() async throws {
         let (server, port) = try await startServer(makeApp())
         let (ws, _) = try await RawClient.webSocket(port: port, path: "/echo")

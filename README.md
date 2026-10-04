@@ -507,7 +507,7 @@ These defenses are on by default and covered by tests that attack a real socket 
 | `Upgrade: h2c` or other unknown upgrades | served as normal HTTP |
 | HTTP/2 rapid reset (CVE-2023-44487), CONTINUATION flood (CVE-2024-27316), SETTINGS/PING floods, HPACK bombs | `GOAWAY` and the connection closes; other clients unaffected |
 | TLS 1.0 / 1.1, non-forward-secret or CBC cipher suites | handshake refused |
-| WebSocket: unmasked frames / invalid UTF-8 / reserved opcodes / oversized frames or messages | close `1002` / `1007` / `1002` / `1009` |
+| WebSocket: unmasked frames / reserved (RSV) bits / invalid UTF-8 / reserved opcodes / oversized frames or messages | close `1002` / `1002` / `1007` / `1002` / `1009` |
 | Cross-site WebSocket hijacking | `403` unless same-origin or in `allowedOrigins` |
 | Malformed WebSocket handshakes, upgrade with a body | `426` / `400` |
 | Path traversal in `serveStatic`, including encoded separators glued to combining marks | `403` (byte-level checks); dotfiles hidden |

@@ -433,7 +433,8 @@ final class WebSocketFrameGuard: ChannelInboundHandler, Sendable {
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let frame = unwrapInboundIn(data)
-        if frame.maskKey == nil {
+        // RFC 6455 §5.2: no extensions are negotiated, so any reserved bit fails the connection.
+        if frame.maskKey == nil || frame.rsv1 || frame.rsv2 || frame.rsv3 {
             reject(context, .protocolError)
         } else if frame.length > maxMessageSize {
             reject(context, .messageTooLarge)
