@@ -465,6 +465,15 @@ struct PipelineFactory: Sendable {
                         // HTTPRequestHandler enforces read deadlines and write stalls itself.
                         if let idle = try? sync.handler(type: IdleStateHandler.self) { sync.removeHandler(idle, promise: nil) }
                         if let idleCloser = try? sync.handler(type: IdleCloseHandler.self) { sync.removeHandler(idleCloser, promise: nil) }
+                        // HTTPRequestHandler queues pipelined requests itself and, without compression,
+                        // serializes responses itself (HTTP1Writer): two handler hops fewer per request.
+                        // Removing the pipelining handler hands its buffered requests on, in order.
+                        if let pipelining = try? sync.handler(type: HTTPServerPipelineHandler.self) {
+                            sync.removeHandler(pipelining, promise: nil)
+                        }
+                        if !factory.config.compression, let encoder = try? sync.handler(type: HTTPResponseEncoder.self) {
+                            sync.removeHandler(encoder, promise: nil)
+                        }
                         try channel.pipeline.syncOperations.addHandler(
                             HTTPRequestHandler(
                                 env: factory.env, mode: .http1(rejection: rejection, overCapacity: overCapacity),

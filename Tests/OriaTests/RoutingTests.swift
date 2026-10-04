@@ -318,6 +318,10 @@ import Testing
         #expect(try await app.test(.GET, "/public/..%2F..%2Fetc%2Fpasswd").status == .forbidden)
         #expect(try await app.test(.GET, "/public/sub/%2E%2E/%2E%2E/x").status == .forbidden)
         #expect(try await app.test(.GET, "/public/.env").status == .notFound)
+        // A separator or dot glued to a combining mark / zero-width joiner (one grapheme cluster).
+        #expect(try await app.test(.GET, "/public/sub%2F%E2%80%8D..%2F..%2Fx").status == .forbidden)
+        #expect(try await app.test(.GET, "/public/..%CC%81%2F%CC%81x").status == .forbidden)
+        #expect(try await app.test(.GET, "/public/.%CC%81env").status == .notFound)
         #expect(try await app.test(.GET, "/public/missing.txt").status == .notFound)
     }
 }

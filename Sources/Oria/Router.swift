@@ -355,12 +355,31 @@ final class CompiledRouter: Sendable {
         let middleware: Middleware
     }
 
-    struct Route: Sendable {
+    /// A class so a lookup result costs one reference count to pass around, not one per field.
+    final class Route: @unchecked Sendable {
         let paramNames: [String]
         let middleware: [Middleware]
         let handler: Handler
         /// Set for `upload(...)` routes: the body streams to disk with these limits.
-        var upload: UploadOptions? = nil
+        let upload: UploadOptions?
+        /// Global middleware + this route's middleware, precomputed when no middleware is
+        /// path-scoped (set once in `CompiledRouter.init`, before the router is shared).
+        fileprivate(set) var chain: [Middleware]
+
+        init(paramNames: [String], middleware: [Middleware], handler: @escaping Handler, upload: UploadOptions? = nil) {
+            self.paramNames = paramNames
+            self.middleware = middleware
+            self.handler = handler
+            self.upload = upload
+            self.chain = middleware
+        }
+    }
+
+    /// The result of routing one request, computed once when its head arrives.
+    struct Lookup {
+        let segments: [Substring]
+        let route: Route?
+        let params: [String: String]
     }
 
     struct WebSocketRoute: Sendable {
@@ -454,6 +473,27 @@ final class CompiledRouter: Sendable {
         self.scopedMiddleware = builder.middleware
         self.hasScopedMiddleware = builder.middleware.contains { !$0.prefix.isEmpty }
         self.globalMiddleware = builder.middleware.map(\.middleware)
+        if !hasScopedMiddleware {
+            let global = globalMiddleware
+            Self.visit(root) { route in route.chain = global + route.middleware }
+        }
+    }
+
+    private static func visit(_ node: Node, _ body: (Route) -> Void) {
+        for route in node.routes.values { body(route) }
+        for child in node.statics.values { visit(child, body) }
+        if let param = node.param { visit(param, body) }
+        if let wildcard = node.wildcard { visit(wildcard, body) }
+    }
+
+    /// Routes a request target (path plus optional query).
+    func lookup(method: HTTPMethod, uri: String) -> Lookup {
+        let path = uri.firstIndex(of: "?").map { uri[..<$0] } ?? uri[...]
+        let segments = path.split(separator: "/", omittingEmptySubsequences: true)
+        if let (route, params) = match(method: method.rawValue, segments: segments) {
+            return Lookup(segments: segments, route: route, params: params)
+        }
+        return Lookup(segments: segments, route: nil, params: [:])
     }
 
     /// Finds the route for a method + path. Static segments win over `:params`, which win over `*`.
@@ -463,13 +503,6 @@ final class CompiledRouter: Sendable {
             if method == "HEAD" { return node.routes["GET"] }
             return nil
         }.map { ($0.0, Self.params($0.0.paramNames, $0.1)) }
-    }
-
-    /// Upload options if `uri` targets an `upload(...)` route (checked when the headers arrive).
-    func uploadOptions(method: HTTPMethod, uri: String) -> UploadOptions? {
-        let path = uri.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""
-        let segments = path.split(separator: "/", omittingEmptySubsequences: true)
-        return match(method: method.rawValue, segments: Array(segments))?.0.upload
     }
 
     /// Finds the WebSocket route for a path.

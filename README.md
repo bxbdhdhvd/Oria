@@ -412,20 +412,36 @@ loop; see the architecture section below.
   connections are spread across them. Routes compile once into an immutable radix trie that every
   thread shares, so lookup takes no locks.
 - **One handler per connection, no hops.** Each HTTP/1.1 connection (or HTTP/2 stream) has a single
-  NIO `ChannelDuplexHandler` that parses the request, runs your `async` handler, and writes the
-  response.
+  NIO `ChannelDuplexHandler` that runs your `async` handler and writes the response. Parsing is
+  NIO's llhttp-based decoder, the battle-tested part.
+  - On plain HTTP/1.1 this handler also takes over from NIO's pipelining handler and response
+    encoder once the connection has made its upgrade decision. It queues pipelined requests itself
+    (reads pause meanwhile, at most 4096 queued parts), and `HTTP1Writer` serializes the status
+    line, headers and small bodies into one buffer, validating headers in the same pass. A typical
+    response is one allocation and one `writev` entry. Streamed responses must match their
+    declared `Content-Length`; a short body closes the connection instead of leaving the client
+    waiting.
+  - Routing happens once per request, when the head arrives. Routes are reference types, and each
+    route's full middleware chain is precomputed when no middleware is path-scoped.
   - Handlers run on a custom Swift Concurrency `TaskExecutor` backed by that connection's event loop
     (`Task(executorPreference:)`).
   - On Swift 6.2, `Task.immediate` starts the handler synchronously inside the read callback. A
     handler that doesn't suspend writes its response in the same event-loop tick that read the
     request, as hand-written NIO code would.
   - When a handler does suspend (a database call, an actor), it resumes on the same event loop, so
-    no thread hops happen and no locks are taken on the request path.
+    the response is written without another thread hop. This executor preference made routes that
+    await an actor 28% cheaper in our measurements, and cost nothing measurable elsewhere.
   - Set `config.runHandlersOnEventLoops = false` to use the global concurrent executor instead. That
     is better if your handlers do heavy CPU work, which would otherwise delay other connections on
     the same loop.
 - **Flush coalescing.** Responses written during a read cycle are flushed once at the end of it, so
   pipelined requests share one `writev`.
+- **Fast JSON.** `res.json` encodes with `FastJSON`, a streaming `Encoder` that writes straight into
+  the response buffer instead of building Foundation's intermediate tree. The output is the same
+  JSON as `JSONEncoder`, checked by differential and randomized tests. A JSON endpoint costs 11–20% less CPU
+  per request (keep-alive / pipelined). Pass `encoder:` to use a configured `JSONEncoder` instead.
+- **Per-loop caches.** The `Date` header is formatted at most once per second per event loop, with
+  no thread-local lookup.
 - **Cheap timers.** Read deadlines, upload idle timeouts and write-stall detection share one
   scheduled check per connection. Arming a deadline is a stored-property write, not a timer
   allocation.
@@ -434,7 +450,7 @@ loop; see the architecture section below.
   responses await the socket. A client that stops reading (slow-read attack) is cut off after
   `idleTimeout`.
 - **Memory safety.** Everything is Swift 6 language mode with strict concurrency checking, so data
-  races are compile errors. No `unsafe` pointer code in the framework:
+  races are compile errors. The framework does no manual pointer arithmetic:
   - Multipart boundary search uses bounds-checked `Span` (Swift 6.2).
   - Buffers are `ByteBuffer` with copy-on-write.
   - The few per-connection fields marked `@exclusivity(unchecked)` are confined to one event loop by
@@ -473,7 +489,7 @@ The included `Dockerfile` is multi-stage. It compiles with `swift:6.2-noble` and
 
 ## Security
 
-These defenses are on by default and covered by tests that attack a real socket (110 tests in total):
+These defenses are on by default and covered by tests that attack a real socket (115 tests in total):
 
 | Attack | Behavior |
 |---|---|
@@ -484,7 +500,7 @@ These defenses are on by default and covered by tests that attack a real socket 
 | Slow-read (client stops reading a large response) | closed after `idleTimeout`; memory stays flat meanwhile |
 | Garbage / non-HTTP input, unknown methods, bad versions | `400` and an immediate close |
 | Response splitting (CR/LF in a header value, e.g. `res.redirect(userInput)`) | refused, `500` instead |
-| Upload path traversal (`../`, absolute, backslashes, NUL in filenames) | filenames sanitized to a base name; temp files are random, `0600`, never visible half-written |
+| Upload path traversal (`../`, absolute, backslashes, NUL in filenames, a `/` or `.` hidden in a grapheme cluster with a combining mark or zero-width joiner, bidi overrides) | filenames sanitized at the Unicode-scalar level to a base name; temp files are random, `0600`, never visible half-written |
 | Upload abuse (too many files/fields, huge part headers, disallowed types, malformed multipart) | `413` / `415` / `400`, temporary files removed |
 | Range amplification (`bytes=0-,0-,0-…`, hundreds of ranges) | ranges merged; >16 ranges serve the file once |
 | Parameter flooding / deeply nested JSON | first 1000 parameters only / `400` (decoder depth limit) |
@@ -494,7 +510,7 @@ These defenses are on by default and covered by tests that attack a real socket 
 | WebSocket: unmasked frames / invalid UTF-8 / reserved opcodes / oversized frames or messages | close `1002` / `1007` / `1002` / `1009` |
 | Cross-site WebSocket hijacking | `403` unless same-origin or in `allowedOrigins` |
 | Malformed WebSocket handshakes, upgrade with a body | `426` / `400` |
-| Path traversal in `serveStatic` | `403`; dotfiles hidden |
+| Path traversal in `serveStatic`, including encoded separators glued to combining marks | `403` (byte-level checks); dotfiles hidden |
 | Slow WebSocket consumers in a broadcast | disconnected after `outboxLimit`; never stall others |
 | File-descriptor exhaustion | accept errors are retried, the server keeps running; cap with `maxConnections` |
 

@@ -363,11 +363,32 @@ struct MultipartParser {
 
     /// Strips directories, control characters and leading dots; caps the length.
     static func sanitize(filename: String) -> String? {
-        let base = filename.split(whereSeparator: { $0 == "/" || $0 == "\\" }).last.map(String.init) ?? ""
-        var cleaned = String(base.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) })
-        while cleaned.hasPrefix(".") { cleaned.removeFirst() }
-        cleaned = String(cleaned.prefix(255))
-        return cleaned.isEmpty ? nil : cleaned
+        // Work on Unicode scalars, not Characters: "/" followed by a combining mark or a zero-width
+        // joiner is a single Character that isn't equal to "/", which would let a separator (or a
+        // leading dot) through.
+        var scalars: [Unicode.Scalar] = []
+        for scalar in filename.unicodeScalars {
+            if scalar == "/" || scalar == "\\" {
+                scalars.removeAll(keepingCapacity: true)  // keep only the last path component
+                continue
+            }
+            switch scalar.properties.generalCategory {
+            case .control, .format, .lineSeparator, .paragraphSeparator, .surrogate, .unassigned, .privateUse:
+                continue  // control characters, bidi overrides and zero-width characters
+            default:
+                scalars.append(scalar)
+            }
+        }
+        while let first = scalars.first, first == "." || first.properties.isWhitespace { scalars.removeFirst() }
+        // At most 255 UTF-8 bytes (common file-system limit), cut on a scalar boundary.
+        var cleaned = String.UnicodeScalarView()
+        var bytes = 0
+        for scalar in scalars {
+            bytes += String(scalar).utf8.count
+            if bytes > 255 { break }
+            cleaned.append(scalar)
+        }
+        return cleaned.isEmpty ? nil : String(cleaned)
     }
 }
 

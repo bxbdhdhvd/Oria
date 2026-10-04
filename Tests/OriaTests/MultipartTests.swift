@@ -83,6 +83,17 @@ import Testing
         #expect(MultipartParser.sanitize(filename: ".htaccess") == "htaccess")
         #expect(MultipartParser.sanitize(filename: "a\u{0}b\nc.txt") == "abc.txt")
         #expect(MultipartParser.sanitize(filename: "../") == nil)
+        // Separators and dots hidden inside grapheme clusters (found by fuzzing).
+        #expect(MultipartParser.sanitize(filename: "a/\u{200D}b.txt") == "b.txt")
+        #expect(MultipartParser.sanitize(filename: "..\u{301}/x") == "x")
+        #expect(MultipartParser.sanitize(filename: ".\u{301}hidden") == "\u{301}hidden")
+        #expect(MultipartParser.sanitize(filename: "evil\u{202E}txt.exe") == "eviltxt.exe")  // bidi override
+        #expect(MultipartParser.sanitize(filename: String(repeating: "é", count: 200))!.utf8.count <= 255)
+        for name in ["a/\u{200D}", "\\\u{301}..", "x/\u{FE0F}/y", "\u{200B}.secret"] {
+            let cleaned = MultipartParser.sanitize(filename: name) ?? ""
+            #expect(!cleaned.unicodeScalars.contains("/") && !cleaned.unicodeScalars.contains("\\"))
+            #expect(cleaned.unicodeScalars.first != ".")
+        }
         let headers = try MultipartParser.parseHeaders(
             ByteBuffer(string: "Content-Disposition: form-data; name=\"f\"; filename=\"x.txt\"; filename*=UTF-8''na%C3%AFve%20file.txt")
         )

@@ -158,24 +158,26 @@ public final class Oria: Router, @unchecked Sendable {
     }
 
     /// Runs a request through middleware, routing, and error handling.
-    func handle(_ req: Request, _ res: Response, router: CompiledRouter) async {
-        let segments = req.path.split(separator: "/", omittingEmptySubsequences: true)
-        let match = router.match(method: req.method.rawValue, segments: segments)
-        if let match { req.params = match.1 }
-
-        let terminal: Handler
-        let routeMiddleware: [Middleware]
-        if let route = match?.0 {
-            terminal = route.handler
-            routeMiddleware = route.middleware
-        } else if router.matchWebSocket(segments: segments) != nil {
-            terminal = Oria.upgradeRequired
-            routeMiddleware = []
-        } else {
-            terminal = router.notFound
-            routeMiddleware = []
+    func handle(_ req: Request, _ res: Response, router: CompiledRouter, lookup: CompiledRouter.Lookup? = nil) async {
+        let lookup = lookup ?? router.lookup(method: req.method, uri: req.url)
+        let segments = lookup.segments
+        if let route = lookup.route {
+            if !route.paramNames.isEmpty { req.params = lookup.params }
+            if !router.hasScopedMiddleware {
+                // Common case: the full chain was precomputed for this route.
+                do {
+                    try await Oria.run(route.chain, 0, route.handler, req, res)
+                } catch {
+                    res.reset()
+                    await router.errorHandler(error, req, res)
+                }
+                return
+            }
+            await runChain(req, res, router: router, segments: segments, routeMiddleware: route.middleware, terminal: route.handler)
+            return
         }
-        await runChain(req, res, router: router, segments: segments, routeMiddleware: routeMiddleware, terminal: terminal)
+        let terminal = router.matchWebSocket(segments: segments) != nil ? Oria.upgradeRequired : router.notFound
+        await runChain(req, res, router: router, segments: segments, routeMiddleware: [], terminal: terminal)
     }
 
     /// Runs the middleware for a WebSocket route before upgrading. Returns true if every middleware
@@ -200,7 +202,8 @@ public final class Oria: Router, @unchecked Sendable {
                 let scoped = router.middleware(for: segments)
                 try await Oria.runScoped(scoped, 0, routeMiddleware, terminal, req, res)
             } else {
-                try await Oria.run(router.globalMiddleware + routeMiddleware, 0, terminal, req, res)
+                let chain = routeMiddleware.isEmpty ? router.globalMiddleware : router.globalMiddleware + routeMiddleware
+                try await Oria.run(chain, 0, terminal, req, res)
             }
         } catch {
             res.reset()
