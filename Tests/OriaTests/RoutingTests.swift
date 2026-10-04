@@ -313,6 +313,23 @@ import Testing
         #expect(second.text == "")
     }
 
+    @Test func symlinksMayNotEscapeTheRoot() async throws {
+        let outside = NSTemporaryDirectory() + "oria-outside-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: outside, withIntermediateDirectories: true)
+        try "top secret".write(toFile: outside + "/secret.txt", atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(atPath: dir + "/leak.txt", withDestinationPath: outside + "/secret.txt")
+        try FileManager.default.createSymbolicLink(atPath: dir + "/leakdir", withDestinationPath: outside)
+        try FileManager.default.createSymbolicLink(atPath: dir + "/inside.css", withDestinationPath: dir + "/sub/app.css")
+        let app = makeApp()
+        #expect(try await app.test(.GET, "/public/leak.txt").status == .notFound)
+        #expect(try await app.test(.GET, "/public/leakdir/secret.txt").status == .notFound)
+        let inside = try await app.test(.GET, "/public/inside.css")
+        #expect(inside.status == .ok && inside.text == "body{}", "symlinks within the root still work")
+        let lenient = Oria()
+        lenient.use("/public", serveStatic(dir, StaticOptions(followSymlinksOutsideRoot: true)))
+        #expect(try await lenient.test(.GET, "/public/leak.txt").text == "top secret")
+    }
+
     @Test func blocksTraversalAndDotfiles() async throws {
         let app = makeApp()
         #expect(try await app.test(.GET, "/public/..%2F..%2Fetc%2Fpasswd").status == .forbidden)

@@ -177,6 +177,19 @@ import Testing
         await server.shutdown()
     }
 
+    /// A refused upgrade with response compression on once tripped NIO's compressor (no request
+    /// head had passed through it).
+    @Test func refusedUpgradeWithCompressionKeepsServing() async throws {
+        let (server, port) = try await startServer(makeApp { $0.compression = true })
+        let (evil, head) = try await RawClient.webSocket(port: port, path: "/echo", headers: ["Origin": "https://evil.example"])
+        #expect(head.hasPrefix("HTTP/1.1 403"))
+        evil.close()
+        let (ok, okHead) = try await RawClient.webSocket(port: port, path: "/echo")
+        expectUpgraded(okHead)
+        ok.close()
+        await server.shutdown()
+    }
+
     @Test func badHandshakesGetAnAnswer() async throws {
         let (server, port) = try await startServer(makeApp())
         let base = "GET /echo HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -228,6 +241,19 @@ import Testing
         let (ws, _) = try await RawClient.webSocket(port: port, path: "/echo")
         try await ws.sendText("not masked", masked: false)
         #expect(await ws.readFrame()?.closeCode == 1002)
+        await server.shutdown()
+    }
+
+    @Test func reservedBitsAreRejected() async throws {
+        let (server, port) = try await startServer(makeApp())
+        for rsv: UInt8 in [0x40, 0x20, 0x10] {
+            let (ws, _) = try await RawClient.webSocket(port: port, path: "/echo")
+            var frame = RawClient.frame(opcode: 0x1, payload: Array("hi".utf8))
+            frame[0] |= rsv  // no extension negotiated: RFC 6455 says fail the connection
+            try await ws.send(frame)
+            #expect(await ws.readFrame()?.closeCode == 1002, "rsv bit \(rsv)")
+            ws.close()
+        }
         await server.shutdown()
     }
 

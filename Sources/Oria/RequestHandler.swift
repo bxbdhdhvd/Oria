@@ -4,6 +4,7 @@ import NIOConcurrencyHelpers
 import NIOCore
 import NIOFileSystem
 import NIOHTTP1
+import NIOHTTPCompression
 
 // MARK: - Running tasks on the event loop
 
@@ -209,7 +210,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
                 context.eventLoop.execute {
                     let head = HTTPRequestHead(version: .http1_1, method: .GET, uri: "/")
                     self.phase = .processing
-                    self.write(rejection, for: head, keepAlive: false)
+                    self.write(rejection, for: head, keepAlive: false, bypassCompressor: true)
                 }
             }
         case .http2(let parent):
@@ -263,8 +264,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
             writeSimple(status, version: .http1_1, close: true)
             return
         }
-        phase = .closing
-        context.close(promise: nil)
+        closeNow()
     }
 
     /// HTTP/1.1 only: a request arriving while the previous response is still pending waits.
@@ -351,8 +351,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
 
     private func begin(_ head: HTTPRequestHead, context: ChannelHandlerContext) {
         guard case .idle = phase else {
-            phase = .closing
-            context.close(promise: nil)
+            closeNow()
             return
         }
         if !isHTTP2 { state.beginRequest() }
@@ -386,8 +385,11 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
                     HTTP1Writer.writeContinue(into: &buffer)
                     context.writeAndFlush(NIOAny(buffer), promise: nil)
                 } else {
+                    // Write the interim head *past* a response compressor: NIO's compressor pairs
+                    // each response head with a request, so a 1xx head would consume the final
+                    // response's slot and crash on the next head.
                     let interim = HTTPResponseHead(version: head.version, status: .continue)
-                    context.writeAndFlush(wrapOutboundOut(.head(interim)), promise: nil)
+                    Self.pastCompressor(context).writeAndFlush(wrapOutboundOut(.head(interim)), promise: nil)
                 }
             }
         }
@@ -617,8 +619,8 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
     }
 
     /// Writes a complete buffered response. On the event loop.
-    private func write(_ res: Response, for request: HTTPRequestHead, keepAlive: Bool) {
-        guard let context else { return }
+    private func write(_ res: Response, for request: HTTPRequestHead, keepAlive: Bool, bypassCompressor: Bool = false) {
+        guard let context = bypassCompressor ? self.context.map(Self.pastCompressor) : self.context else { return }
         var body: ByteBuffer?
         if case .buffer(let buffer) = res.body { body = buffer }
         if rawOutput {
@@ -632,7 +634,14 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         responseStarted = true
         context.write(wrapOutboundOut(.head(prepared.head)), promise: nil)
         if let body, !prepared.omitBody { context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil) }
-        endResponse(keepAlive: keepAlive)
+        endResponse(keepAlive: keepAlive, via: context)
+    }
+
+    /// The context just past NIO's response compressor (or our own if there is none). Responses that
+    /// don't answer a request the compressor saw (parse errors, refused upgrades, interim 1xx) must
+    /// bypass it: it pairs every response head with a request and traps when there is none.
+    private static func pastCompressor(_ context: ChannelHandlerContext) -> ChannelHandlerContext {
+        (try? context.pipeline.syncOperations.context(handlerType: HTTPResponseCompressor.self)) ?? context
     }
 
     private static func statusForbidsBody(_ status: HTTPResponseStatus) -> Bool {
@@ -799,16 +808,18 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         headers.add(name: "content-length", value: String(body.readableBytes))
         if close && !isHTTP2 { headers.add(name: "connection", value: "close") }
         headers.add(name: "date", value: HTTPDate.now())
-        context.write(wrapOutboundOut(.head(HTTPResponseHead(version: version, status: status, headers: headers))), promise: nil)
-        context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+        // Canned responses bypass the compressor (see `pastCompressor`); they always close on HTTP/1.1.
+        let target = Self.pastCompressor(context)
+        target.write(wrapOutboundOut(.head(HTTPResponseHead(version: version, status: status, headers: headers))), promise: nil)
+        target.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
         let promise = completeRequest(keepAlive: !close)
-        context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: promise)
+        target.writeAndFlush(wrapOutboundOut(.end(nil)), promise: promise)
         afterResponse()
     }
 
     /// Writes the final `.end` (parts mode). State is updated *before* the write.
-    private func endResponse(keepAlive: Bool) {
-        guard let context else { return }
+    private func endResponse(keepAlive: Bool, via target: ChannelHandlerContext? = nil) {
+        guard let context = target ?? self.context else { return }
         let promise = completeRequest(keepAlive: keepAlive)
         emit(wrapOutboundOut(.end(nil)), promise: promise, context: context)
         afterResponse()
@@ -856,6 +867,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
             state.requestFinished()
             phase = .idle
             requestComplete = false
+            responseStarted = false  // the next request (or its parse error) gets its own response
             if let timeout = env.requestReadTimeout { deadline = .now() + timeout }
             return nil
         }
@@ -876,10 +888,30 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         if !queue.isEmpty || pendingRead { drainQueue() }
     }
 
+    /// Timeouts and stalled readers: reset the connection (SO_LINGER 0) instead of a graceful close.
+    /// A graceful close would leave the kernel holding the unsent bytes for a peer that never reads
+    /// (FIN_WAIT1 with a zero window) for minutes; a reset frees them at once.
+    private func abortConnection() {
+        if !isHTTP2, let provider = context?.channel as? SocketOptionProvider {
+            _ = provider.setSoLinger(linger(l_onoff: 1, l_linger: 0))
+        }
+        queue.removeAll()
+        flushPending = false
+        phase = .closing
+        context?.close(promise: nil)
+    }
+
     private func closeNow() {
         phase = .closing
         queue.removeAll()
-        context?.close(promise: nil)
+        guard let context else { return }
+        // Responses already written but held for a coalesced flush go out first: closing a NIO
+        // channel drops unflushed writes.
+        if flushPending {
+            flushPending = false
+            context.flush()
+        }
+        context.close(promise: nil)
     }
 
     // MARK: Read deadline
@@ -889,7 +921,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
         checker = context.eventLoop.scheduleTask(in: max(delay, .milliseconds(1))) { [self] in
             guard let context = self.context, context.channel.isActive else { return }
             if let stall = self.writeStallDeadline, NIODeadline.now() >= stall {
-                self.closeNow()
+                self.abortConnection()
                 return
             }
             let now = NIODeadline.now()
@@ -897,7 +929,7 @@ final class HTTPRequestHandler: ChannelDuplexHandler, RemovableChannelHandler, @
             if let deadline = self.deadline {
                 if now >= deadline {
                     if case .uploading(let upload) = self.phase { upload.sink.finish(ChannelError.eof) }
-                    self.closeNow()
+                    self.abortConnection()
                     return
                 }
                 next = min(next, deadline - now)

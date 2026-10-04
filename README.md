@@ -45,40 +45,66 @@ try await app.listen(3000)
 ## Performance
 
 Measured in a container limited to **2 CPU cores and 256 MB of RAM** (`--cpuset-cpus=0,1
---memory=256m`), with the load generator pinned to the other 2 cores of the same 4-vCPU cloud VM.
-Release build, no logging. Reproduce everything below with `scripts/container-bench.sh`.
+--memory=256m`), with the load generator pinned to the other 2 cores of the same 4-vCPU cloud VM
+(Xeon @ 2.1 GHz). Release build, no logging. Reproduce everything below with
+`scripts/container-bench.sh`.
 
 | Workload | Result |
 |---|---|
-| HTTP/1.1 `GET /` plaintext, pipelined ×16, 64 conns | **100k req/s** |
-| HTTP/1.1 `GET /json`, pipelined ×16, 64 conns | **65k req/s** |
-| HTTP/1.1 `GET /` keep-alive (one request at a time), 64 conns | **32.6k req/s**, p50 1.8 ms, p99 4.3 ms |
-| HTTP/1.1 `GET /json`, 1 / 2 / 4 conns | 8.7k / 16.1k / 25.7k req/s, **p50 104–132 µs, p99 329 / 570 / 890 µs** |
-| Router + rate limiter + `actor` call, keep-alive, 64 conns | 22.2k req/s, p99 5.6 ms |
-| HTTP/2 over TLS, 64 conns × 16 streams (h2load) | 25.2k req/s, 0 failed |
-| WebSocket echo round trips, 256 conns, 32 B | 31.7k msg/s, p99 17.6 ms |
-| 1 GiB raw upload (`PUT`, streamed to disk) | 3.6 s, **server peak RSS 29 MB** |
-| 1 GiB multipart upload (`curl -F`) | 4.6 s |
-| 32 parallel 32 MiB uploads | 3.5 s, all 200, peak RSS 66 MB |
-| 1 GiB file download / 1 MB range from the middle | 2.3 s, byte-identical / `206`, byte-identical |
-| 4 GiB generated streaming response | 1.8 s (≈2.3 GB/s) |
+| HTTP/1.1 `GET /` plaintext, pipelined ×16, 64 conns | **254k req/s** |
+| HTTP/1.1 `GET /json`, pipelined ×16, 64 conns | **199k req/s** |
+| HTTP/1.1 `GET /` keep-alive (one request at a time), 64 conns | **67k req/s**, p50 0.96 ms, p99 1.9 ms |
+| HTTP/1.1 `GET /json` keep-alive, 4 / 8 / 16 conns | 55k / 60k / 63k req/s, **p50 63–228 µs, p99 0.25–0.7 ms** |
+| HTTP/1.1 `GET /json` keep-alive, 1 conn | 15.5k req/s, p50 58 µs, p99 0.45 ms |
+| Router + rate limiter + `actor` call + JSON, keep-alive, 64 conns | 54k req/s, p99 2.3 ms |
+| HTTP/2 over TLS, 64 conns × 16 streams (h2load) | 41.5k req/s, 0 failed |
+| WebSocket echo round trips, 256 conns, 32 B | 61k msg/s, p99 9.5 ms |
+| 1 GiB raw upload (`PUT`, streamed to disk) | 3.3 s, server peak RSS ~29 MB |
+| 1 GiB multipart upload (`curl -F`) | 3.2 s |
+| 32 parallel 32 MiB uploads | 3.5 s, all 200, peak RSS 75 MB |
+| 1 GiB file download / 1 MB range from the middle | 4.2 s, byte-identical / `206`, byte-identical |
+| 4 GiB generated streaming response | 1.0 s (≈4 GB/s) |
 | Idle memory | ~26 MB RSS |
+
+**Optimization history.** The same machine, the same 2 cores; before and after builds were run
+alternately so VM noise affects both equally. CPU is server CPU time per request.
+
+| Workload | Before | After | Change |
+|---|---|---|---|
+| Plaintext, pipelined | 167k req/s, 11.9 µs | 259k req/s, 7.6 µs | +55% |
+| JSON, pipelined | 113k req/s, 17.4 µs | 192k req/s, 10.3 µs | +70% |
+| Plaintext, keep-alive | 47k req/s, 41 µs | 77k req/s, 25 µs | +64% |
+| JSON, keep-alive | 38k req/s, 51 µs | 54k req/s, 36 µs | +44% |
+| Router + actor + JSON, keep-alive | 36k req/s, 53 µs | 54k req/s, 36 µs | +48% |
+
+The changes:
+- own HTTP/1.1 pipelining and response serializer (`HTTP1Writer`) instead of NIO's handler and
+  encoder;
+- a streaming JSON encoder;
+- routing once per request, with precomputed middleware chains;
+- per-loop `Date` caches;
+- promises allocated only when a close follows.
+
+For comparison, SwiftNIO's own minimal HTTP/1.1 example server on the same cores needs 29 µs per
+keep-alive request and 25 µs per pipelined request.
 
 **How to read these numbers.**
 
-- The server-side work per request is small. On this VM a request costs about 54 µs of CPU, of
-  which the kernel's loopback TCP path (`writev`/`read`/`epoll`) is the largest part. Without
-  pipelining, the kernel is the limit: a bare SwiftNIO "hello world" on the same 2 cores does 46k
-  req/s. Oria spends about 20% more CPU per request than bare NIO, for routing, middleware,
-  `async` handlers and Express-style request/response objects.
+- **Keep-alive is now limited by the kernel.** Each request costs exactly one `read` and one
+  `write` syscall (`epoll_wait` is batched across requests), and most of the ~25 µs is the
+  kernel's TCP loopback path. Oria's own work is a few microseconds.
 - **≥100k req/s on 2 cores** is reached with pipelining (which is how TechEmpower measures
-  plaintext) or with more cores. Throughput scales with cores, because each event loop is
-  independent and the hot path takes no locks. On a dedicated 4–8 core machine, with the load
-  generator elsewhere, expect roughly 2–4× the keep-alive numbers above.
-- **Sub-millisecond p99** holds until the CPU saturates: p99 is 0.89 ms at 25.7k req/s on 2 cores.
-  Once the CPU is fully busy (64 connections hammering 2 cores), requests queue and p99 is a few
-  milliseconds, as with any server. Size for about 60–70% CPU if you need sub-ms
-  tails. These are shared, noisy cloud vCPUs, so dedicated hardware tails will be tighter.
+  plaintext; 254k here) or with more cores. Each event loop is independent and the hot path takes
+  no locks, so throughput scales with cores. With a separate load-generator machine and 4–8
+  dedicated cores, expect several times the keep-alive numbers above.
+- **Sub-millisecond p99** holds up to about 60k req/s on these 2 cores (p99 0.25–0.7 ms at 4–16
+  connections). Once the CPU is saturated (64 connections hammering 2 cores), requests queue and
+  p99 rises to a few milliseconds, as with any server. Size for about 60–70% CPU if you need
+  sub-ms tails. These are shared cloud vCPUs, so occasional outliers come from the VM.
+- **HTTP/2 is the slowest protocol** (≈46 µs per request). Most of that is SwiftNIO creating a
+  child channel and pipeline per stream. A frame-level HTTP/2 handler is the next optimization
+  target. If you terminate TLS/HTTP/2 at a load balancer and speak HTTP/1.1 to Oria, you get the
+  HTTP/1.1 numbers.
 
 ## Install
 
@@ -375,7 +401,7 @@ to cap streams per connection.
 |---|---|
 | `logger()` | `morgan('dev')` |
 | `cors(CORSOptions(...))` | `cors()`. Handles preflight requests. |
-| `serveStatic("./public", StaticOptions(...))` | `express.static()`. Non-blocking, streamed, ETag/304 support, blocks path traversal and dotfiles. |
+| `serveStatic("./public", StaticOptions(...))` | `express.static()`. Non-blocking, streamed, ETag/304 support, blocks path traversal, dotfiles and symlinks that leave the root. |
 | `rateLimit(max:window:key:)` | `express-rate-limit`. Sharded fixed window, sets `RateLimit-*` and `Retry-After`. |
 | `securityHeaders(SecurityHeadersOptions())` | `helmet()`. `nosniff`, `X-Frame-Options`, CSP, `Referrer-Policy`, COOP, and HSTS on HTTPS. |
 
@@ -489,7 +515,7 @@ The included `Dockerfile` is multi-stage. It compiles with `swift:6.2-noble` and
 
 ## Security
 
-These defenses are on by default and covered by tests that attack a real socket (115 tests in total):
+These defenses are on by default and covered by tests that attack a real socket (121 tests in total):
 
 | Attack | Behavior |
 |---|---|
@@ -497,7 +523,7 @@ These defenses are on by default and covered by tests that attack a real socket 
 | Header, URL and header-count bombs | `431`/`400` (`maxHeaderSize`, `maxHeaderCount`) |
 | Huge or endless bodies, including chunked | `413` (`maxBodySize`, per-route `UploadOptions`), refused before reading when `Content-Length` says so |
 | Slowloris (dribbled headers), slow-body uploads | closed after `requestReadTimeout` / upload `idleTimeout` |
-| Slow-read (client stops reading a large response) | closed after `idleTimeout`; memory stays flat meanwhile |
+| Slow-read (client stops reading a large response) | connection reset after `idleTimeout` (abortive close, so the kernel doesn't keep the unsent bytes around either); memory stays flat meanwhile |
 | Garbage / non-HTTP input, unknown methods, bad versions | `400` and an immediate close |
 | Response splitting (CR/LF in a header value, e.g. `res.redirect(userInput)`) | refused, `500` instead |
 | Upload path traversal (`../`, absolute, backslashes, NUL in filenames, a `/` or `.` hidden in a grapheme cluster with a combining mark or zero-width joiner, bidi overrides) | filenames sanitized at the Unicode-scalar level to a base name; temp files are random, `0600`, never visible half-written |
@@ -507,28 +533,50 @@ These defenses are on by default and covered by tests that attack a real socket 
 | `Upgrade: h2c` or other unknown upgrades | served as normal HTTP |
 | HTTP/2 rapid reset (CVE-2023-44487), CONTINUATION flood (CVE-2024-27316), SETTINGS/PING floods, HPACK bombs | `GOAWAY` and the connection closes; other clients unaffected |
 | TLS 1.0 / 1.1, non-forward-secret or CBC cipher suites | handshake refused |
-| WebSocket: unmasked frames / invalid UTF-8 / reserved opcodes / oversized frames or messages | close `1002` / `1007` / `1002` / `1009` |
+| WebSocket: unmasked frames / reserved (RSV) bits / invalid UTF-8 / reserved opcodes / oversized frames or messages | close `1002` / `1002` / `1007` / `1002` / `1009` |
 | Cross-site WebSocket hijacking | `403` unless same-origin or in `allowedOrigins` |
 | Malformed WebSocket handshakes, upgrade with a body | `426` / `400` |
 | Path traversal in `serveStatic`, including encoded separators glued to combining marks | `403` (byte-level checks); dotfiles hidden |
+| Symlinks in a served directory pointing outside it | not served (real path must stay under the real root; `followSymlinksOutsideRoot` to opt out) |
+| `Expect: 100-continue`, parse errors and refused upgrades with compression on | answered correctly (these bypass the compressor, which would otherwise trap on a response with no matching request) |
+| Valid pipelined requests followed by garbage | their responses arrive in order, then `400` and close |
 | Slow WebSocket consumers in a broadcast | disconnected after `outboxLimit`; never stall others |
 | File-descriptor exhaustion | accept errors are retried, the server keeps running; cap with `maxConnections` |
 
-**Penetration test.** An independent black-box pass ran these attacks against a release build over
-HTTP/1.1, HTTPS + HTTP/2 and WebSocket. It covered smuggling variants, limit bypasses, slowloris /
-slow-POST / slow-read, upload traversal (verified on disk), malformed multipart, range abuse,
-HTTP/2 floods (2000-stream rapid reset, 20k SETTINGS/PING frames, CONTINUATION flood, 40 KB header
-lists), TLS downgrade, WebSocket protocol violations, header injection and 800 idle connections.
+**Penetration tests.** Two rounds of independent testing ran against release builds.
 
-- Results: **no crashes, no Critical or High findings.** Peak RSS during the floods was 41 MB.
-- Fixed since: the two Medium findings (WebSocket origin default, slow-read drain) and the Low ones
-  (legacy TLS 1.2 cipher, handshake error answers, upgrade-with-body).
+- **Round 1** was black-box: HTTP/1.1, HTTPS + HTTP/2 and WebSocket. No crashes and no Critical or
+  High findings. Its Medium and Low findings were fixed: WebSocket origin default, slow-read drain,
+  a legacy TLS 1.2 cipher, handshake error answers, and upgrade-with-body.
+- **Round 2** came after the performance work. It had three parallel passes plus a fuzzing
+  campaign:
+  - *HTTP/1.1 fast path* (the new pipelining queue and serializer). Findings, all fixed:
+    - **Critical:** with `compression = true`, a single `Expect: 100-continue` request crashed the
+      process. Introduced and caught in the same development cycle; never in a release.
+    - **High:** valid pipelined responses were dropped when a later request in the same packet
+      failed to parse.
+    - **Medium:** a later malformed request got a silent close instead of a `400`.
+  - *HTTP/2, TLS, WebSocket.* All floods (rapid reset, CONTINUATION, PING, SETTINGS, PRIORITY,
+    empty DATA) end in `GOAWAY`. Zero-window streams of 100 MB responses hold no memory.
+    h2-to-h1 smuggling attempts are rejected, as are cross-origin WebSocket handshakes. Only TLS
+    1.2/1.3 with ECDHE+AEAD is accepted, and renegotiation is refused. One Low finding was fixed:
+    reserved WebSocket RSV bits.
+  - *Uploads, files, JSON, resource use.* Two Medium findings, both fixed:
+    - `serveStatic` followed symlinks out of its root.
+    - Stalled readers lingered in the kernel (`FIN_WAIT1`) after the server closed them; they are
+      now reset.
+
+    Traversal attempts (including Unicode tricks), multipart abuse, range and conditional edge
+    cases and JSON escaping all held. RSS peaked around 42 MB under 500 slowloris connections plus
+    150 concurrent downloads.
+  - *Fuzzing.* Found one bypass in upload-filename sanitizing (a `/` hidden in a grapheme cluster
+    with a zero-width joiner). Fixed; the same class of bug was also closed in `serveStatic`.
+- Every finding has a regression test.
 - Remaining Low/Info items:
   - An overflowing chunk size (`FFFFFFFFFFFFFFFF`) waits for `requestReadTimeout` instead of an
-    immediate `400`. That is NIO parser behavior and not exploitable for smuggling.
+    immediate `400` (NIO parser behavior; not exploitable for smuggling).
+  - HTTP/2 `WINDOW_UPDATE` floods aren't rate-limited by NIOHTTP2. They are cheap and bounded.
   - `maxConnections` is unlimited by default; set it.
-  - An oversized WebSocket frame can end with a TCP reset rather than a visible 1009, because the
-    socket closes with unread input.
 
 Not handled for you: authentication, CSRF tokens for cookie-authenticated forms, per-user rate
 limits beyond `rateLimit`'s IP key, antivirus/content scanning of uploads, and disk quotas (cap
@@ -602,7 +650,7 @@ Read it from `server.port` and call `await server.shutdown()` when done.
 
 ```bash
 swift build
-swift test                                   # 110 tests: routing, HTTP/1, HTTP/2, TLS, WebSockets, uploads, ranges, attacks
+swift test                                   # 121 tests: routing, HTTP/1, HTTP/2, TLS, WebSockets, uploads, ranges, attacks
 ORIA_MEMORY_TESTS=1 swift test --filter uploadMemoryStaysFlat   # RSS check, run alone
 swift run -c release oria-example            # example app on :3000
 scripts/bench.sh 256 10s                     # HTTP/1.1 load test (needs wrk)
