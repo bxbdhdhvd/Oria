@@ -115,7 +115,12 @@ public final class Oria: Router, @unchecked Sendable {
                 let threads =
                     Oria.concurrencyRunsOnEventLoops.load(ordering: .relaxed)
                     ? NIOSingletons.groupLoopCountSuggestion : configuration.threads
-                print("Oria listening on http://\(host):\(address.port ?? port) (\(threads) threads)")
+                // 0.0.0.0 / :: mean "all interfaces", not an address to browse to (Safari refuses it),
+                // so print a URL that opens locally.
+                let scheme = configuration.tls == nil ? "http" : "https"
+                let shown = host == "0.0.0.0" || host == "::" ? "localhost" : host
+                let note = shown == host ? "" : ", all interfaces"
+                print("Oria listening on \(scheme)://\(shown):\(address.port ?? port) (\(threads) threads\(note))")
                 fflush(nil)
             }
         }
